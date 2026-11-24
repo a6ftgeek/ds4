@@ -7,6 +7,38 @@
 #include <rocwmma/rocwmma.hpp>
 #endif
 
+/* Network-TP expert ownership.  A bound rank owns one contiguous window
+ * [base, base+count) of every layer's routed experts; the launcher rewrites the
+ * router selection to local ids (or -1 for a peer-owned expert) and rebases the
+ * expert-table offsets onto the window.  Same contract as ds4_cuda.cu. */
+__device__ __forceinline__ static bool moe_owned_local_expert(
+        int32_t expert,
+        uint32_t expert_base,
+        uint32_t expert_count,
+        uint32_t *local_expert) {
+    if (expert < 0) return false;
+    const uint32_t e = (uint32_t)expert;
+    if (e < expert_base || e - expert_base >= expert_count) return false;
+    if (local_expert) *local_expert = e - expert_base;
+    return true;
+}
+
+__global__ static void moe_copy_owned_pairs_kernel(
+        int32_t *local_ids,
+        float *local_weights,
+        const int32_t *ids,
+        const float *weights,
+        uint32_t pairs,
+        uint32_t first,
+        uint32_t count) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pairs) return;
+    uint32_t local = 0;
+    const bool owned = moe_owned_local_expert(ids[i], first, count, &local);
+    local_ids[i] = owned ? (int32_t)local : -1;
+    local_weights[i] = owned ? weights[i] : 0.0f;
+}
+
 __global__ static void moe_swiglu_weighted_f32_kernel(
         float * __restrict__ mid,
         const float * __restrict__ gate,
@@ -1252,11 +1284,17 @@ __global__ static void moe_count_sorted_pairs_kernel(
         uint32_t *counts,
         const int32_t *selected,
         uint32_t pair_count,
-        uint32_t n_total_expert) {
+        uint32_t n_total_expert,
+        uint32_t drop_negative) {
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
-    if (expert_i < 0) expert_i = 0;
+    if (expert_i < 0) {
+        /* A negative id marks a peer-owned pair under network TP; it must not
+         * join any bucket, or the owned experts would be computed twice. */
+        if (drop_negative) return;
+        expert_i = 0;
+    }
     if ((uint32_t)expert_i >= n_total_expert) return;
     atomicAdd(counts + (uint32_t)expert_i, 1u);
 }
@@ -1282,11 +1320,15 @@ __global__ static void moe_scatter_sorted_pairs_kernel(
         uint32_t *cursors,
         const int32_t *selected,
         uint32_t pair_count,
-        uint32_t n_total_expert) {
+        uint32_t n_total_expert,
+        uint32_t drop_negative) {
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
-    if (expert_i < 0) expert_i = 0;
+    if (expert_i < 0) {
+        if (drop_negative) return;
+        expert_i = 0;
+    }
     if ((uint32_t)expert_i >= n_total_expert) return;
     uint32_t pos = atomicAdd(cursors + (uint32_t)expert_i, 1u);
     sorted_pairs[pos] = pair;
@@ -1299,13 +1341,17 @@ __global__ static void moe_scatter_sorted_pairs_deterministic_kernel(
         const uint32_t *offsets,
         const int32_t *selected,
         uint32_t pair_count,
-        uint32_t n_total_expert) {
+        uint32_t n_total_expert,
+        uint32_t drop_negative) {
     const uint32_t expert = (uint32_t)blockIdx.x;
     if (expert >= n_total_expert || threadIdx.x != 0u) return;
     uint32_t pos = offsets[expert];
     for (uint32_t pair = 0; pair < pair_count; pair++) {
         int32_t expert_i = selected[pair];
-        if (expert_i < 0) expert_i = 0;
+        if (expert_i < 0) {
+            if (drop_negative) continue;
+            expert_i = 0;
+        }
         if ((uint32_t)expert_i == expert) sorted_pairs[pos++] = pair;
     }
 }

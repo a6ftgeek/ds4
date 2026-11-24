@@ -83,6 +83,25 @@ struct ds4_gpu_tensor {
     int owner;
 };
 
+/* Network tensor parallelism: a bound rank owns one contiguous half of every
+ * layer's routed experts (weights_model_map_sharded_spans in ds4.c maps exactly
+ * that range).  The routed-MoE launcher filters the router selection to the
+ * owned range and rebases the three expert-table offsets onto it, so a
+ * non-owned expert's bytes are never read.  This mirrors ds4_cuda.cu's
+ * g_network_tp_rank gate; rank -1 means "no network TP bound". */
+int g_network_tp_rank = -1;
+bool g_network_tp_sharding_suspended = false;
+static int32_t *g_network_tp_pairs_ids;
+static float *g_network_tp_pairs_weights;
+static uint64_t g_network_tp_pairs_bytes;
+
+static void ds4_rocm_tp_pairs_release(void) {
+    if (g_network_tp_pairs_ids) (void)cudaFree(g_network_tp_pairs_ids);
+    g_network_tp_pairs_ids = NULL;
+    g_network_tp_pairs_weights = NULL;
+    g_network_tp_pairs_bytes = 0;
+}
+
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
     uint8_t qs[CUDA_QK_K / 4];
@@ -198,11 +217,15 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
     g_rocm_tp.row = fn;
     g_rocm_tp.ud = ud;
     g_rocm_tp.vec_bytes = vec_bytes;
+    g_network_tp_rank = (int)rank;
     return 1;
 }
 
 extern "C" void ds4_gpu_tp_shutdown(void) {
     if (g_rocm_tp.row) (void)cudaDeviceSynchronize();
+    g_network_tp_rank = -1;
+    g_network_tp_sharding_suspended = false;
+    ds4_rocm_tp_pairs_release();
     if (g_rocm_tp.staging) (void)cudaFreeHost(g_rocm_tp.staging);
     g_rocm_tp = {};
 }
@@ -264,7 +287,9 @@ extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
 }
 
 extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
-    (void)suspend;
+    /* The DSpark drafter runs single-rank while this is set: keep the raw
+     * (unfiltered) expert tables reachable for the leader's own draft pass. */
+    g_network_tp_sharding_suspended = suspend != 0;
 }
 
 extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {

@@ -24190,6 +24190,36 @@ static int metal_graph_hc_pre_f32_fused(
         const ds4_tensor *fn, const ds4_tensor *scale, const ds4_tensor *base,
         const ds4_tensor *norm_w, uint32_t n_tokens);
 
+/* Half of the tensor-parallel attention work needs device kernels that hold a
+ * *partial* attention-output projection: the group-sliced Q8 output pair
+ * (ds4_gpu_attention_output_q8_tp_tensor) and the row-range prefill attention
+ * (ds4_gpu_attention_prefill_{raw,static_mixed}_heads_range_tensor).  Those are
+ * CUDA/Metal-only today, so a ROCm rank replicates the whole attention block
+ * instead and only the routed experts are split by ownership.  Both ranks reach
+ * the same answer, so no ATTN gate is needed on that backend. */
+static bool metal_graph_tp_attn_split_supported(void) {
+#if defined(DS4_ROCM_BUILD)
+    return false;
+#else
+    return true;
+#endif
+}
+
+/* Contributors to the FFN exchange sum their partials on both ranks.  When a
+ * backend cannot slice the shared expert by K, both ranks evaluate it in full
+ * and each exposes exactly half of the result, so the exchanged sum still
+ * reconstructs the single-rank vector exactly (x + 0 is exact in IEEE 754). */
+static DS4_MAYBE_UNUSED bool metal_graph_tp_zero_peer_half(ds4_gpu_graph *g, ds4_gpu_tensor *v) {
+    if (!g || !v || v->bytes < (uint64_t)DS4_N_EMBD * sizeof(float)) return false;
+    const uint64_t elems = (uint64_t)DS4_N_EMBD / 2u;
+    const uint64_t off = g->tp_rank == 0 ? elems * sizeof(float) : 0u;
+    ds4_gpu_tensor *half = ds4_gpu_tensor_view(v, off, elems * sizeof(float));
+    if (!half) return false;
+    const int ok = ds4_gpu_tensor_fill_f32(half, 0.0f, elems) != 0;
+    ds4_gpu_tensor_free(half);
+    return ok != 0;
+}
+
 static bool metal_graph_encode_decode_layer_phase(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -24250,7 +24280,10 @@ static bool metal_graph_encode_decode_layer_phase(
     const int cuda_tp_home_tier = g->active_tier;
     const int cuda_tp_partner_tier = g->cuda_tp_decode
         ? metal_graph_cuda_tp_partner_tier(cuda_tp_home_tier) : -1;
-    const bool tp_split_attn = g->tp_world == 2;
+    /* Head-slice the decode q path only where the group-sliced attention
+     * output exists; a backend without it computes every head on both ranks. */
+    const bool tp_split_attn =
+        g->tp_world == 2 && metal_graph_tp_attn_split_supported();
     const uint32_t tp_heads = tp_split_attn ?
         (uint32_t)DS4_N_HEAD / 2u : (uint32_t)DS4_N_HEAD;
     const uint32_t tp_head0 = tp_split_attn ? g->tp_rank * tp_heads : 0;
@@ -25736,6 +25769,10 @@ static bool metal_graph_encode_decode_layer_phase(
         (n_groups % 2u) == 0u;
     ds4_gpu_tensor *tp_attn_a = NULL;   /* rank partials consumed directly */
     ds4_gpu_tensor *tp_attn_b = NULL;   /* by the HC expand */
+    /* A ROCm rank cannot form the group-sliced attention-output partial yet, so
+     * it computes the full block locally and there is nothing to exchange. */
+    const bool tp_attn_partial =
+        g->tp_world == 2 && metal_graph_tp_attn_split_supported();
     const bool fuse_attn_out_hc =
         !cuda_tp_attn &&
         g->tp_world < 2 &&
@@ -25936,7 +25973,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                         DS4_N_EMBD,
                                                         DS4_N_HC) != 0;
         }
-    } else if (ok && g->tp_world == 2) {
+    } else if (ok && tp_attn_partial) {
         /* Group-sliced attention output: this rank computes its half of the
          * output groups and the matching k-window of the expand projection,
          * leaving a partial block output in the gate slot. */
@@ -25959,7 +25996,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 DS4_N_EMBD,
                 metal_graph_heads(g));
     } else if (ok && layer->attn_output_a->type != DS4_TENSOR_Q8_0) {
-        ds4_gpu_tensor *attn_out_dst = g->tp_world == 2 ?
+        ds4_gpu_tensor *attn_out_dst = tp_attn_partial ?
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN] : metal_graph_attn_out(g);
         ok = metal_graph_attention_output_dense_quant_low(metal_graph_attn_low(g),
                                                           g,
@@ -25978,7 +26015,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                            metal_graph_attn_low(g),
                                                            1);
     } else if (ok) {
-        ds4_gpu_tensor *attn_out_dst = g->tp_world == 2 ?
+        ds4_gpu_tensor *attn_out_dst = tp_attn_partial ?
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN] : metal_graph_attn_out(g);
         ok = ds4_gpu_attention_output_q8_batch_tensor(attn_out_dst,
                                                         metal_graph_attn_low(g),
@@ -25992,7 +26029,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                         n_groups, DS4_N_EMBD,
                                                         metal_graph_heads(g), 1) != 0;
     }
-    if (ok && g->tp_world == 2) {
+    if (ok && tp_attn_partial) {
         /* Gate ATTN: exchange the attention block output with the peer and
          * rebuild the canonical sum (rank0 first, then rank1) in attn_out
          * on both ranks — identical expression on both machines keeps them
@@ -27380,6 +27417,28 @@ static bool metal_graph_encode_decode_layer_phase(
         /* Gate/up/SwiGLU was encoded as the first independent dispatch in
          * the concurrent FFN encoder. */
     } else if (ok && tp_split_shared) {
+#ifdef DS4_ROCM_BUILD
+        /* No Q8_0 K-slice down kernel on ROCm yet: evaluate the whole shared
+         * expert here and let the down step expose this rank's half only. */
+        ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_gate(g),
+                                                   model,
+                                                   layer->ffn_gate_shexp,
+                                                   DS4_N_EMBD,
+                                                   shared_dim,
+                                                   metal_graph_ffn_norm(g),
+                                                   1);
+        if (ok) ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_up(g),
+                                                           model,
+                                                           layer->ffn_up_shexp,
+                                                           DS4_N_EMBD,
+                                                           shared_dim,
+                                                           metal_graph_ffn_norm(g),
+                                                           1);
+        if (ok) ok = ds4_gpu_swiglu_tensor(metal_graph_shared_mid(g),
+                                           metal_graph_shared_gate(g),
+                                           metal_graph_shared_up(g),
+                                           shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+#else
         /* Shared expert lane slice: the fused gate/up/swiglu kernel covers
          * this rank's half of the intermediate (row slicing is pure offset
          * math), compact at the buffer base; the down k-slice below turns
@@ -27427,6 +27486,7 @@ static bool metal_graph_encode_decode_layer_phase(
             if (ok) ok = ds4_gpu_swiglu_tensor(metal_graph_shared_mid(g), metal_graph_shared_gate(g), metal_graph_shared_up(g),
                                                tp_half, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
         }
+#endif
     } else if (ok && fuse_shared_gate_up && router_shared_done == 0) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(metal_graph_shared_gate(g),
                                                          metal_graph_shared_up(g),
@@ -27585,6 +27645,18 @@ static bool metal_graph_encode_decode_layer_phase(
                     DS4_N_HC) != 0;
         }
     } else if (ok && tp_split_shared) {
+#ifdef DS4_ROCM_BUILD
+        /* Full shared down on both ranks; the exchange sum keeps one half from
+         * each side, which is exactly the single-rank result. */
+        ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_out(g),
+                                                   model,
+                                                   layer->ffn_down_shexp,
+                                                   shared_dim,
+                                                   DS4_N_EMBD,
+                                                   metal_graph_shared_mid(g),
+                                                   1) &&
+             metal_graph_tp_zero_peer_half(g, metal_graph_shared_out(g));
+#else
         ok = metal_graph_matmul_dense_quant_kslice(metal_graph_shared_out(g),
                                                    model,
                                                    layer->ffn_down_shexp,
@@ -27594,6 +27666,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                    DS4_N_EMBD,
                                                    metal_graph_shared_mid(g),
                                                    0);
+#endif
     } else if (ok) {
         ok = metal_graph_matmul_dense_quant_tensor(metal_graph_shared_out(g),
                                                    model,
@@ -30948,6 +31021,14 @@ static uint32_t metal_graph_tp_prefill_split_min(void) {
         const char *env = getenv("DS4_TP_PREFILL_SPLIT_MIN");
         if (env && env[0]) cached = atoi(env);
         if (cached < 2) cached = 2;
+#if defined(DS4_ROCM_BUILD)
+        /* Splitting the chunk rows needs the row-range prefill attention
+         * kernels and the shared-expert down K-slice, both still CUDA/Metal
+         * only.  A ROCm rank therefore keeps attention and the shared expert
+         * replicated over all chunk rows and splits only the routed experts by
+         * ownership.  The env still overrides this for isolation runs. */
+        if (!env || !env[0]) cached = (int)UINT32_MAX;
+#endif
     }
     return (uint32_t)cached;
 }

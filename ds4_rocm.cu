@@ -230,7 +230,14 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
     return 1;
 }
 
+static unsigned long long g_tp_gate_count;
+static int g_tp_gate_stats = -1;
+
 extern "C" void ds4_gpu_tp_shutdown(void) {
+    if (g_tp_gate_stats && g_tp_gate_count)
+        fprintf(stderr, "ds4: ROCm TP gate exchanges: %llu total, %llu per "
+                "layer sweep (expect 2 x 40)\n",
+                g_tp_gate_count, g_tp_gate_count / 40ull);
     if (g_rocm_tp.row) (void)cudaDeviceSynchronize();
     g_network_tp_rank = -1;
     g_network_tp_world = 1;
@@ -244,6 +251,8 @@ extern "C" int ds4_gpu_tp_failed(void) { return g_rocm_tp.failed ? 1 : 0; }
 
 extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     if (!g_rocm_tp.row || g_rocm_tp.failed) return 0;
+    if (g_tp_gate_stats < 0) g_tp_gate_stats = getenv("DS4_TP_GATE_STATS") != NULL;
+    if (g_tp_gate_stats) g_tp_gate_count++;
     /* Do not leave the graph running ahead of a remote process. */
     const int ok = cuda_ok(cudaDeviceSynchronize(), "TP row arrival") &&
         g_rocm_tp.row(g_rocm_tp.ud, layer, gate, ++g_rocm_tp.row_seq);

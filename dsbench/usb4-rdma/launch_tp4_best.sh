@@ -1,44 +1,64 @@
 #!/bin/bash
 # DS4 4-node TP=4 over the switchless USB4 RDMA ring -- best verified setup.
 #
-# Verified 2026-11-24 on feat/rocm-tp-ring @ 79a9247, 81 GiB Q2 weights
-# (DeepSeek-V4-Flash-...-0731.gguf), greedy, all four ranks 192.168.1.101-104:
+# Default model: gguf/DeepSeek-V4.1-Flash-Q4.gguf
+#   518,596,067,328 B, sha256
+#   a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e,
+#   byte-identical on node1-4 (ranks 0-3).
 #
-#   ctx 2048   : prefill 64.25 t/s, generation 9.65 t/s, GTT peak 37.82 GiB/rank,
-#                resident 26.34 GiB/rank; generated text md5
-#                a13ba035b8347fa92e602fd8f751ca91, byte-identical to the TP=1
-#                reference (the canonical 16-token check).
-#   ctx 1048576: allocates and runs. KV 13.79 GiB (raw 0.36 + compressed 13.44)
-#                + 8.00 GiB buffers + 26.34 GiB resident = 48.13 GiB planned,
-#                GTT peak 47.88 GiB/rank, MemAvailable min 42.85 GiB/64 GiB on
-#                node1. A 30,474-token story prompt (fact deep inside, task at
-#                the end) answered Bob=34, Alice=52, Clara=71 -- the exact
-#                written-out assignments -- so compressed KV retrieval works.
+# Verified 2026-11-24 on feat/rocm-tp-full-stack @ 6d75052, greedy --temp 0,
+# ranks 192.168.1.101-104, `--tensor-parallel --transport usb4-rdma
+# --tp-world-size 4 --tp-cpu-core 2`:
 #
-# Vision: OFF. ./download_model.sh ds41f-vision is the V4.1 sidecar; the 0731
-#   checkpoint is rejected at ds4.c:74106 ("--vision requires ... the pinned
-#   DeepSeek V4 Flash Vision-Exp or V4.1 Flash model"), and V4.1 vision itself
-#   is Metal-only (ds4.c:74034). The 0731 weights carry no vision projection.
-# DSpark: OFF by default (DSPARK=1 turns it on). The N-rank verify gate is
-#   generalized (tp_batch_rows is set for world>=2), so a world=4 verify block
-#   now uses the same batched per-layer gate as world=2 instead of the per-layer
-#   bulk exchange: verify 742 -> ~320 ms/cycle on coding and TP=4 DSpark goes
-#   4.00-4.18 -> 7.22-7.98 t/s. It is still a net loss against 9.4-9.5 t/s:
-#     TP=4 coding  9.45 -> 7.22 t/s (-24%, accept 82.50%, 33/40)
-#     TP=4 prose   9.35 -> 7.98 t/s (-15%, accept 90.00%, 9/10)
-#   The canonical 16-token greedy md5 (a13ba035...) and the coding 64-token md5
-#   (4a10b554...) match the non-speculative run with seed batches on or off.
-#   The prose continuation differs (de52e3b2 vs e728672c): that is the batched
-#   verifier's reduction order and is identical to TP=2 DSpark, which already
-#   behaves this way. TP=2 coding remains the one net win (10.04 -> 14.45 t/s).
-#   Remaining gap and the audit are in dsbench/usb4-rdma/FEATURE_STATUS.md.
+#   ctx 2048 (271-token coding prompt):
+#     CLI prefill 11.12 t/s, generation 5.12 t/s
+#     CLIP 12.09/8.04 and 9.94/5.95 on repeat runs (first-token warmup varies)
+#     TP expert shard 80.56 GiB of 294.14 GiB per rank, 82.11 GiB planned,
+#     GTT peak 82.13 GiB/rank, MemAvailable min 22.15 GiB
+#     coherent answer that traces patience sorting correctly through
+#     [3,1,4,1,5,9,2,6,5,3,5] (tails 3 -> 1 -> 1,4 -> ... -> 1,4,5,9)
+#   ctx 1048576:
+#     KV 6.26 GiB (compressed) + 12.35 GiB buffers + 80.56 GiB resident
+#     = 99.17 GiB planned; GTT peak 97.83 GiB/rank (79% of the 124 GiB pool);
+#     MemAvailable min node1 5.61 GiB, node2 18.59, node3 23.06, node4 23.09.
+#     CLI prefill 10.74 t/s, generation 7.30 t/s (n=32).
+#     HTTP API (ds4-server, same 4-rank ring): /v1/models reports
+#     context_length 1048576; a 74-token chat completion TTFT 6.72 s
+#     (measured: the server logs "prompt done 6.715s"), decode 9.84 t/s over
+#     160 tokens, 22.975 s total. Answer was coherent and correct.
+#
+# Performance vs the 0731 V4 Q2 reference at TP=4 (ctx 2048): prefill
+# 64.25 -> 11.12 t/s (-83%) because V4.1 prefill here runs the per-token
+# scalar path with a ring gate per layer (the batched V4.1 prefill path is
+# not wired at world=4 yet), plus Engram rows read from disk; decode
+# 9.65 -> 9.84 t/s through the server (5.1-8.0 through the CLI, which
+# flushes per token). Resident grows 26.34 -> 80.56 GiB/rank because Q4
+# weights are 6x the Q2 file.
+#
+# Vision: OFF and not wired. ./download_model.sh ds41f-vision is the V4.1
+#   encoder on all four nodes, but V4.1 vision is hard-gated to Metal
+#   (ds4.c:74034, "ds4: V4.1 vision requires Metal") and the ROCm backend has
+#   no V4.1 vision kernels. This launcher never passes --vision.
+# DSpark: OFF by default (DSPARK=1 enables --dspark with the 0731 drafter).
+#   There is NO V4.1 drafter: download_model.sh has no ds41f-dspark target, the
+#   HF repo ships only Q2/Q4/Vision, and the repo README says drafter weights
+#   are not interchangeable across checkpoints. The only drafter on disk,
+#   gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf, belongs to 0731, so DSpark
+#   cannot be measured on Q4 -- expect DSPARK=1 to be meaningless here.
+#
+# Rank fan-out: node1 -> node2 ssh is unreliable on this fabric (shared host
+#   keys + auth). The script tries ssh nodeN from the coordinator with retries;
+#   if that fails it prints the exact commands and stops before the
+#   coordinator starts, so no half-boot is left behind. From the Windows host
+#   (where `ssh nodeN` works) start ranks 1-3 with e.g.
+#     ssh node2 'nohup bash launch_worker_cmd.sh 1 > /tmp/tp4_r1.log 2>&1 &'
+#   or the equivalent `toolbox run ... --role worker --tp-rank N` line, then
+#   run this script with WORKERS_STARTED=1 to start only the coordinator.
 #
 # usage: bash launch_tp4_best.sh [prompt-file] [n_tokens]
-# env:   CTX (default 1048576), TP_CORE (2), PORT (19730), TIMEOUT (3600),
-#        DSPARK (0)
-#
-# rank 0 = node1 (coordinator, started last). Ranks 1-3 = node2-4.
-# --tp-cpu-core is mandatory: unpinned busy-poll ring threads lose ~40% decode.
+# env:   MODEL (q4 default; 0731 for the verified Q2 path; or a literal path),
+#        CTX (1048576), TP_CORE (2), PORT (19730), TIMEOUT (3600),
+#        DSPARK (0), WORKERS_STARTED (0)
 
 set -u
 
@@ -49,16 +69,24 @@ CTX=${CTX:-1048576}
 TP_CORE=${TP_CORE:-2}
 PORT=${PORT:-19730}
 TIMEOUT=${TIMEOUT:-3600}
+WORKERS_STARTED=${WORKERS_STARTED:-0}
 # Speculative decode is opt-in while its net effect is measured: DSPARK=1 adds
 # --dspark and the 0731 support drafter plus DS4_DSPARK_STATS=1 so the leader
 # prints cycles/proposed/accepted/accept_rate. The default stays the verified
-# non-speculative configuration.
+# non-speculative configuration. There is no V4.1 drafter -- see the header.
 DSPARK=${DSPARK:-0}
 DSPARK_MODEL=${DSPARK_MODEL:-gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf}
 
-M='gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf'
+MODEL=${MODEL:-q4}
+case "$MODEL" in
+    q4|ds41f-q4)  M='gguf/DeepSeek-V4.1-Flash-Q4.gguf' ;;
+    0731|q2|v4)   M='gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf' ;;
+    *)            M=$MODEL ;;
+esac
+
 IPS=(192.168.1.101 192.168.1.102 192.168.1.103 192.168.1.104)
 HOSTS=(node1 node2 node3 node4)
+SSHOPT=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
 TAG=${TAG:-tp4best}
 
 [ -f "$REPO/$M" ] || { echo "missing model: $REPO/$M" >&2; exit 1; }
@@ -72,29 +100,53 @@ common=(-m "$M" -c "$CTX" --temp 0 -n "$NTOK" --prompt-file "$PROMPT" --rocm
         "${ring[@]}" --tp-cpu-core "$TP_CORE")
 if [ "$DSPARK" = 1 ]; then
     common+=(--dspark --mtp-model "$DSPARK_MODEL")
+    case "$M" in
+        *V4.1*) echo "warning: DSPARK=1 on a V4.1 model uses the 0731 drafter;" \
+                       "no V4.1 drafter exists (see header)" >&2 ;;
+    esac
 fi
 DS4_ENV="USB4_RING_QP_TIMEOUT=14"
 [ "$DSPARK" = 1 ] && DS4_ENV="$DS4_ENV DS4_DSPARK_STATS=1"
 
 cleanup() {
     for ((r=1; r<4; r++)); do
-        ssh -o BatchMode=yes "${HOSTS[$r]}" 'pkill -x ds4 2>/dev/null' >/dev/null 2>&1
+        ssh "${SSHOPT[@]}" "${HOSTS[$r]}" 'pkill -x ds4 2>/dev/null' >/dev/null 2>&1
     done
     pkill -x ds4 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
-echo "== DS4 TP=4 USB4 ring: ctx=$CTX n=$NTOK prompt=$PROMPT"
+echo "== DS4 TP=4 USB4 ring: model=$M ctx=$CTX n=$NTOK prompt=$PROMPT"
 cleanup; sleep 1
 
-for ((r=1; r<4; r++)); do
-    h=${HOSTS[$r]}
-    ssh -o BatchMode=yes "$h" \
-        "cd \$HOME/dev/ds4-v41-pp/src && exec toolbox run -c vllm-gfx1151 -- env $DS4_ENV ./ds4 ${common[*]} --role worker --tp-rank $r --coordinator ${IPS[0]} $PORT" \
-        > "/tmp/${TAG}_r${r}.log" 2>&1 &
-    echo "started rank $r on $h"
-done
-sleep 6
+if [ "$WORKERS_STARTED" != 1 ]; then
+    for ((r=1; r<4; r++)); do
+        h=${HOSTS[$r]}
+        started=0
+        for attempt in 1 2 3 4; do
+            nohup ssh "${SSHOPT[@]}" "$h" \
+                "cd \$HOME/dev/ds4-v41-pp/src && exec toolbox run -c vllm-gfx1151 -- env $DS4_ENV ./ds4 ${common[*]} --role worker --tp-rank $r --coordinator ${IPS[0]} $PORT" \
+                > "/tmp/${TAG}_r${r}.log" 2>&1 &
+            sleep 5
+            if ! grep -qa 'Permission denied\|Host key verification' "/tmp/${TAG}_r${r}.log" 2>/dev/null; then
+                started=1; echo "started rank $r on $h (attempt $attempt)"; break
+            fi
+            echo "rank $r: ssh to $h failed (attempt $attempt)" >&2
+            sleep 2
+        done
+        if [ "$started" != 1 ]; then
+            cat >&2 <<EOF
+cannot reach $h over ssh from this node; start the ranks from the host that can:
+  ssh $h 'cd \$HOME/dev/ds4-v41-pp/src && toolbox run -c vllm-gfx1151 -- env $DS4_ENV ./ds4 ${common[*]} --role worker --tp-rank $r --coordinator ${IPS[0]} $PORT' > /tmp/${TAG}_r${r}.log 2>&1 &
+then rerun: WORKERS_STARTED=1 bash $0 $PROMPT $NTOK
+EOF
+            exit 3
+        fi
+    done
+    sleep 6
+else
+    echo "WORKERS_STARTED=1: ranks 1-3 are expected to be running already"
+fi
 
 cd "$REPO" || exit 1
 timeout "$TIMEOUT" toolbox run -c vllm-gfx1151 -- env $DS4_ENV \
@@ -104,6 +156,12 @@ timeout "$TIMEOUT" toolbox run -c vllm-gfx1151 -- env $DS4_ENV \
 rc=$?
 echo "coordinator exit=$rc"
 sleep 2
+
+if [ "$WORKERS_STARTED" = 1 ]; then
+    for ((r=1; r<4; r++)); do
+        ssh "${SSHOPT[@]}" "${HOSTS[$r]}" 'pkill -x ds4 2>/dev/null' >/dev/null 2>&1
+    done
+fi
 cleanup
 
 echo "== result"

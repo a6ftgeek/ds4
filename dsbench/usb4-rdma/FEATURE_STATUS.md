@@ -12,6 +12,61 @@ per host, ranks 0-3 on node1-4, `--tp-cpu-core 2`.
 | Vision (`--vision`) | **blocked** | all four ranks exit 1 with the rejection below; GTT stays 16.4 MiB | `ds4.c:74106`; `ds4.c:74034`; `ds4.c:6707`; `ds4.c:7458` |
 | DSpark / MTP (`--dspark --mtp-model`) | **runs at N ranks on the batched verify gate; net loss at TP=4** | the N-rank verify gate is generalized (`tp_batch_rows` at world>=2), so a world=4 verify block costs ~320 ms/cycle instead of the per-layer bulk exchange's 742-870 ms and DSpark improves from 4.00-4.18 to 7.22-7.98 t/s. Against 9.35-9.45 t/s without DSpark that is still -15% to -24%, so `--dspark` stays off in `launch_tp4_best.sh` | performance: the 4-rank ring all-reduce costs 6 serialized round trips per layer gate plus ~1 software-HCA stall per block; the batched verifier's reduction order also changes the prose continuation |
 
+## V4.1 Flash Q4 at TP=4 (ROCm)
+
+Verified 2026-11-24 on `feat/rocm-tp-full-stack` @ `6d75052`, four nodes, one
+518,596,067,328 B `DeepSeek-V4.1-Flash-Q4.gguf` per host, `--temp 0`,
+`--tensor-parallel --transport usb4-rdma --tp-world-size 4 --tp-cpu-core 2`.
+
+V4.1 originally refused network TP on ROCm: `ds4.c:74141` required
+`--tp-world 1` under `DS4_ROCM_BUILD`, and when that gate was forced open the
+first prefill token failed in `ds41_attention_expand`:
+
+```
+ds4: v41 trace: layer 0 attention_expand failed
+ds4: v41 trace: layer 0 attention failed
+ds4: v41 trace: layer 0 before_moe failed (stage -1)
+ds4: V4.1 layer 0 failed at position 0
+```
+
+`ds41_attention_expand` -> `ds41_attention_b` -> `metal_graph_matmul_dense_quant_kslice`
+-> `ds4_gpu_matmul_quant_kslice_tensor`, which was a `ROCM_UNAVAILABLE_INT`
+stub in `ds4_rocm_unavailable.cu` and returned 0 with no message (a clean
+failure, not a hang or garbage). The group-sliced attention output needs that
+K-slice projection because each rank keeps only `DS4_N_OUT_GROUP / world` = 2
+of the 8 output groups, i.e. `k_off = rank * 2048`, `k_cnt = 2048` of the
+8192-wide `attn_output_b` row. `ds4_gpu_matmul_q8_0_kslice_tensor` was also a
+stub (it printed "tensor parallelism is Metal-only").
+
+Ported 1:1 from `ds4_cuda.cu`: `ds4_gpu_matmul_q8_0_kslice_rows_tensor` (new
+`matmul_q8_0_kslice_preq_warp8_kernel`), `ds4_gpu_matmul_q8_0_kslice_tensor`,
+`ds4_gpu_matmul_quant_kslice_tensor`, and
+`ds4_gpu_routed_moe_batch_owned_tensor` (delegates to the existing
+`routed_moe_launch` ownership window). Two 2-rank assumptions were also
+fixed: the N-rank gate combine is now `own + in` (the ring hands back
+`total - own`, `ds4_tp.c:566`), and the attention partial is all-reduced at
+`world > 2` instead of only at `world == 2`.
+
+| item | ctx 2048 | ctx 1048576 |
+|---|---|---|
+| prefill | 11.12 t/s (CLI), 11.03 t/s (API) | 10.74 t/s |
+| decode | 5.12 t/s (CLI), 9.84 t/s (API) | 7.30 t/s (CLI) |
+| TTFT | - | 6.72 s measured for 74 prompt tokens (API) |
+| resident/rank | 80.56 GiB | 80.56 GiB |
+| planned | 82.11 GiB | 99.17 GiB (KV 6.26 + buffers 12.35) |
+| GTT peak/rank | 82.13 GiB | 97.83 GiB of the 124 GiB pool |
+| MemAvailable min | 22.15 GiB (node1) | 5.61 GiB (node1), 18.59/23.06/23.09 |
+
+Against the 0731 V4 Q2 reference at TP=4 / ctx 2048 (64.25 prefill, 9.65
+decode, 37.82 GTT, 26.34 resident) the Q4 model trades memory for quality:
+resident 3.1x and GTT 2.6x higher, prefill 5.8x slower (V4.1 prefill runs the
+per-token scalar path with a ring gate per layer and reads Engram rows from
+disk), decode about the same through the serving path.
+
+`ds4-server` serves the same 4-rank ring: `/v1/models` reports
+`context_length: 1048576`, and a 74-token chat completion produced a coherent,
+correct answer (2*(N-1) = 6 hops for N=4) in 22.975 s at 9.84 t/s decode.
+
 ## Vision
 
 `./download_model.sh ds41f-vision` downloads `DeepSeek-V4.1-Flash-Vision.gguf`

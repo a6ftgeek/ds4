@@ -31031,8 +31031,25 @@ static ds4_gpu_tensor *metal_graph_tensor_row_range_view(
                                  (uint64_t)rows * row_values * sizeof(float));
 }
 
-/* TP prefill threshold for row-splitting the replicated shared expert.
- * Routed experts remain ownership-split at every batch size. */
+/* Balanced, disjoint N-way split of n row indices across `world` ranks.
+ * Rank r owns rows [row0, row0 + rows); the remainder goes to the
+ * lowest-numbered ranks, so the ranges cover every row exactly once.  At
+ * world == 2 this reproduces the original two-way split exactly: rank 0 gets
+ * (n + 1) / 2 rows and rank 1 the rest. */
+static void metal_graph_tp_row_partition(uint32_t n, uint32_t world, uint32_t rank,
+                                         uint32_t *row0, uint32_t *rows) {
+    const uint32_t w = world > 0 ? world : 1u;
+    const uint32_t base = n / w;
+    const uint32_t rem = n % w;
+    *rows = base + (rank < rem ? 1u : 0u);
+    *row0 = rank * base + (rank < rem ? rank : rem);
+}
+
+/* TP prefill threshold for row-splitting the replicated attention chunk.
+ * Only the attention row split needs the row-range prefill attention
+ * kernels, both still CUDA/Metal only.  A ROCm rank therefore keeps attention
+ * replicated over all chunk rows and splits only the routed experts by
+ * ownership.  The env still overrides this for isolation runs. */
 static uint32_t metal_graph_tp_prefill_split_min(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -31041,13 +31058,24 @@ static uint32_t metal_graph_tp_prefill_split_min(void) {
         if (env && env[0]) cached = atoi(env);
         if (cached < 2) cached = 2;
 #if defined(DS4_ROCM_BUILD)
-        /* Splitting the chunk rows needs the row-range prefill attention
-         * kernels and the shared-expert down K-slice, both still CUDA/Metal
-         * only.  A ROCm rank therefore keeps attention and the shared expert
-         * replicated over all chunk rows and splits only the routed experts by
-         * ownership.  The env still overrides this for isolation runs. */
         if (!env || !env[0]) cached = (int)UINT32_MAX;
 #endif
+    }
+    return (uint32_t)cached;
+}
+
+/* TP prefill threshold for row-splitting the replicated shared expert.
+ * Routed experts remain ownership-split at every batch size.  Unlike the
+ * attention row split this one only needs dense Q8 matmuls, SwiGLU, an
+ * elementwise add and the bulk exchange, all of which the ROCm backend has,
+ * so it is not clamped off there. */
+static uint32_t metal_graph_tp_prefill_ffn_split_min(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 32;
+        const char *env = getenv("DS4_TP_PREFILL_SPLIT_MIN");
+        if (env && env[0]) cached = atoi(env);
+        if (cached < 2) cached = 2;
     }
     return (uint32_t)cached;
 }
@@ -33475,24 +33503,36 @@ static bool metal_graph_encode_layer_ffn_batch(
     } while (0)
 
     bool shared_done = false;
-    /* With 50/50 expert residency, every rank evaluates every prompt row
-     * against its local expert half.  For large chunks the replicated shared
-     * expert remains row-split; its rows are folded into the local routed
-     * partial before the one all-reduce-style bulk exchange. */
+    /* Every rank evaluates every prompt row against its resident expert
+     * slice, so the routed partial covers all rows.  The replicated shared
+     * expert is row-split across the ranks; its rows are folded into the
+     * matching rows of the local routed partial before the one
+     * all-reduce-style bulk exchange. */
     const bool tp_split_ffn = g->tp_world >= 2;
     const uint32_t tp_batch_slot = g->tp_verify_heads ? 2u * il + 1u : il;
     /* The negotiated policy covers both splits: a diagnostic on just one
      * rank must not change whether the exchanged FFN includes shared work. */
     const bool tp_shared_slice = g->tp_verify_heads && tp_split_ffn &&
                                  g->tp_batch_rows == n_tokens;
+    /* Every rank owns a disjoint, balanced slice of the chunk rows and
+     * evaluates the replicated shared expert only for those rows, folding
+     * them into the same rows of its routed partial ("own rows").  The bulk
+     * exchange below is an all-reduce (sum) of the full-row routed partials,
+     * so a row's shared term is contributed by exactly one rank and the
+     * summed FFN output is unchanged for any world size.  Ranks with no row
+     * (only possible when n_tokens < tp_world) disable the split instead of
+     * launching zero-row work. */
     const bool tp_row_split_ffn =
-        g->tp_world == 2 && tp_split_ffn && g->tp_batch_rows != n_tokens && !keep_ffn_out &&
+        tp_split_ffn && g->tp_batch_rows != n_tokens && !keep_ffn_out &&
         !metal_graph_directional_steering_ffn_enabled(g) &&
-        n_tokens >= metal_graph_tp_prefill_split_min();
-    const uint32_t tp_half_rows = (n_tokens + 1u) / 2u;
-    const uint32_t tp_row0 = (tp_row_split_ffn && g->tp_rank != 0) ? tp_half_rows : 0;
-    const uint32_t tp_rows = tp_row_split_ffn ?
-        (g->tp_rank == 0 ? tp_half_rows : n_tokens - tp_half_rows) : n_tokens;
+        g->tp_world <= n_tokens &&
+        n_tokens >= metal_graph_tp_prefill_ffn_split_min();
+    uint32_t tp_row0 = 0;
+    uint32_t tp_rows = n_tokens;
+    if (tp_row_split_ffn) {
+        metal_graph_tp_row_partition(n_tokens, g->tp_world, g->tp_rank,
+                                     &tp_row0, &tp_rows);
+    }
     ds4_gpu_tensor *tp_ffn_x = tp_row_split_ffn ?
         metal_graph_tensor_row_range_view(metal_graph_batch_ffn_norm(g), tp_row0, tp_rows,
                                           DS4_N_EMBD) : NULL;
@@ -33897,8 +33937,8 @@ static bool metal_graph_encode_layer_ffn_batch(
 
     if (ok && tp_row_split_ffn) {
         /* Each shared-expert row must appear exactly once in the all-reduce.
-         * Fold this rank's shared rows into its full-row routed partial; the
-         * peer does the same for the complementary rows. */
+         * Fold this rank's shared rows into the matching rows of its full-row
+         * routed partial; every other rank does the same for its own rows. */
         ds4_gpu_tensor *own_rows =
             metal_graph_tensor_row_range_view(metal_graph_batch_routed_out(g), tp_row0,
                                               tp_rows, DS4_N_EMBD);

@@ -746,7 +746,7 @@ int ds4_tp_validate_engine_options(
         if (opt->tp.requested || opt->tp.transport != DS4_TP_TRANSPORT_AUTO ||
             opt->tp.rdma_device || opt->tp.rdma_gid_index_set ||
             opt->tp.glm_token_prefill || opt->tp.debug_hash != 0 ||
-            opt->tp.world_size > 2 || opt->tp.ring_cpu_core >= 0 ||
+            opt->tp.world_size > 2 || opt->tp.ring_cpu_core > 0 ||
             opt->tp.ring_ip[0] != NULL) {
             tp_set_err(err, errlen,
                        "tensor-parallel options require --tensor-parallel and --role");

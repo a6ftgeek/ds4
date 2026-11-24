@@ -706,3 +706,99 @@ Cockpit: <https://192.168.1.101:9090> -> **Services** -> `ds4-tp4.service`
 - `feat/rocm-tp-ring` = `49d6ce9`, `feat/usb4-rdma-ring` = `e26ee49` (untouched).
 - `ds4` md5 **6f3c1fe471ddced353807a65bab5c5d9** and `ds4-server` md5
   **7db66c88681a710475a75077a82d9a6c** on node1-node4.
+
+## Final read-only verification (2026-11-24)
+
+Live 4-node TP=4 stack, model `deepseek-v4.1-flash`, `ds4-tp4.service`
+`active (running)` with `NRestarts=0` before and after the run. Every
+request went to `http://127.0.0.1:8000/v1` on node1 with `max_tokens: 256`
+and `temperature: 0`. Prompts were synthetic numbered-paragraph filler with
+a unique vault-code needle (`QX-4417`) near the start and a relay-identifier
+needle (`BR-9032`) near the middle; the closing question asked for both.
+
+### Context-depth sweep
+
+| depth | prompt tokens | prefill t/s | prefill s | TTFT s | decode t/s | gen | needle recall |
+|---|---|---|---|---|---|---|---|
+| 4K | 4005 | 99.86 | 40.11 | 40.34 | 13.05 | 57 | vault PASS, relay PASS |
+| 16K | 15882 | 133.21 | 119.24 | 119.48 | 12.39 | 62 | vault PASS, relay PASS |
+| 64K | 63538 | 150.46 | 422.30 | 422.56 | 12.62 | 69 | vault PASS, relay PASS |
+
+Targets were 4096/16384/65536 tokens; the paragraphs tokenize at ~37.0
+tokens each at scale (measured from `usage.prompt_tokens`), so the actual
+counts above are 4005 / 15882 / 63538. Each depth answered exactly
+`VAULT=QX-4417` and `RELAY=BR-9032`.
+
+How each column was obtained:
+
+- prompt tokens: response `usage.prompt_tokens`, identical to the coordinator
+  journal `chat ctx=0..N:N`.
+- prefill t/s and prefill s: coordinator journal, last
+  `prefill chunk ... avg=X t/s` and `prompt done Xs` (engine-measured);
+  prompt_tokens / prompt_done_s reproduces the same rate.
+- TTFT: client wall clock on node1, POST send to first streamed delta
+  (reasoning or content). It sits 0.23-0.27 s above the engine's
+  `prompt done`, i.e. network + first-token dispatch.
+- decode t/s: coordinator journal `decoding ... avg=X t/s`, engine-measured
+  over all generated tokens (reasoning + content); `gen` matches
+  `usage.completion_tokens`.
+
+Peak GTT and minimum MemAvailable per node, sampled every 8 s on all four
+nodes for the whole request (GTT from
+`/sys/class/drm/card1/device/mem_info_gtt_used`, MemAvailable from
+`/proc/meminfo`; the 8 s interval can in principle miss a sub-interval spike):
+
+| depth | node1 GTT / MemAvail | node2 | node3 | node4 |
+|---|---|---|---|---|
+| 4K | 98.80 GiB / 21.92 GiB | 97.91 GiB / 22.66 GiB | 97.91 GiB / 22.65 GiB | 97.90 GiB / 22.69 GiB |
+| 16K | 98.88 GiB / 21.71 GiB | 97.99 GiB / 22.46 GiB | 97.99 GiB / 22.45 GiB | 97.98 GiB / 22.48 GiB |
+| 64K | 99.06 GiB / 21.29 GiB | 98.16 GiB / 22.02 GiB | 98.17 GiB / 22.00 GiB | 98.15 GiB / 22.04 GiB |
+
+GTT rises only ~0.3 GiB from 4K to 64K; the 63.5K KV is compressed.
+
+### KV-cache prefix reuse
+
+- Turn 1: 4005 prompt tokens, TTFT **40.61 s**, prefill 99.45 t/s,
+  `cached_tokens: 0`.
+- Turn 2: the identical message list plus the turn-1 assistant reply and one
+  short follow-up user message, 4078 prompt tokens, TTFT **1.56 s**,
+  engine `prompt done 1.33 s`, `cached_tokens: 4062` of 4078 (only 16 new
+  tokens written).
+
+TTFT fell 40.61 -> 1.56 s (-96%). Verdict: prefix KV reuse is active.
+The timing drop alone is an inference; the `cached_tokens` accounting is
+direct evidence that 99.6% of the turn-2 prompt reused cached KV rather
+than being re-prefilled.
+
+### Tool calling
+
+A request with the `get_weather` function schema and the prompt
+"What's the weather in Paris?" returned HTTP 200 with one structured call
+and `finish_reason: tool_calls`:
+
+```json
+"tool_calls": [
+  {
+    "id": "call_9220a7a442cabb3b2d7ce8a34e09e17f",
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "arguments": "{\"location\":\"Paris\"}"
+    }
+  }
+]
+```
+
+`function.name` is `get_weather`; `arguments` is a string that parses as
+JSON to the object `{"location": "Paris"}` (valid JSON, `location`
+present); `content` is empty and `reasoning_content` is 62 chars, as
+expected for a tool call.
+
+### RNR / timeout / restart evidence
+
+`journalctl -u ds4-tp4.service` over the full run window (11.44 min, 360
+journal lines): `grep -aiE 'RNR|TIMEOUT|retry|flushed|bad|desync'` -> **0
+matches**. `systemctl show -p NRestarts ds4-tp4.service` ->
+`NRestarts=0`; `systemctl is-active` -> `active`.
+
+Raw driver: `/tmp/fb/results.json` on node1 (not committed).

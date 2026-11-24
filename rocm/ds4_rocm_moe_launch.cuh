@@ -210,7 +210,9 @@ static int routed_moe_q2_float_down_launch(
         uint32_t expert_mid_dim,
         uint32_t out_dim,
         uint64_t down_expert_bytes,
-        uint64_t down_row_bytes) {
+        uint64_t down_row_bytes,
+        const int32_t *owned_selected,
+        int owned_rows) {
     if (!out || !down || !mid || !down_w || !counts || !offsets || !sorted_pairs ||
         n_tokens == 0u || n_total_expert == 0u || n_total_expert > DS4_ROCM_MAX_N_EXPERT ||
         n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
@@ -456,7 +458,20 @@ static int routed_moe_q2_float_down_launch(
 #endif
 
     const uint64_t n = (uint64_t)n_tokens * out_dim;
-    if (use_f16_down && (out_dim & 1u) == 0u) {
+    if (owned_rows && owned_selected) {
+        if (use_f16_down && (out_dim & 1u) == 0u) {
+            const uint64_t n2 = (uint64_t)n_tokens * (out_dim >> 1u);
+            moe_sum_owned_f16x2_kernel<<<(n2 + 255u) / 256u, 256>>>(
+                    (float *)out->ptr, down_h, owned_selected, out_dim, n_expert, n_tokens);
+        } else if (use_f16_down) {
+            moe_sum_owned_f16_kernel<<<(n + 255u) / 256u, 256>>>(
+                    (float *)out->ptr, down_h, owned_selected, out_dim, n_expert, n_tokens);
+        } else {
+            moe_sum_owned_kernel<<<(n + 255u) / 256u, 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr, owned_selected,
+                    out_dim, n_expert, n_tokens);
+        }
+    } else if (use_f16_down && (out_dim & 1u) == 0u) {
         const uint64_t n2 = (uint64_t)n_tokens * (out_dim >> 1u);
         moe_sum_f16x2_kernel<<<(n2 + 255u) / 256u, 256>>>(
                 (float *)out->ptr, down_h, out_dim, n_expert, n_tokens);
@@ -824,18 +839,17 @@ static int routed_moe_launch(
             iq2_gate_path && getenv("DS4_ROCM_DISABLE_RESIDENT_IQ2_SORTED") != NULL;
         const uint32_t use_mxfp4_tiny_batch =
             mxfp4_path && n_tokens <= 4u;
+        /* The sorted/bucketed prefill also serves a rank that owns an expert
+         * window: the buckets hold only this rank's pairs, and the per-token
+         * down sum skips the peer-owned slots instead of adding their stale
+         * scratch rows, so two half-runs add up to the unfiltered result the
+         * way the direct path does.  The ownership rollback that forced the
+         * direct path cost ~15% prefill (157.8 -> 135.0 t/s on one node). */
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
             !use_mxfp4_tiny_batch &&
             (!q4k_path || n_tokens >= 32u) &&
-            !disable_resident_iq2_sorted &&
-            /* The sorted/bucketed prefill path does not reproduce the owned-expert
-             * partial yet: with the ownership split two half-runs add up to
-             * ~1.7e-6 of the unfiltered MoE output on the direct path but drift
-             * by up to 23.3 absolute here.  Until that is fixed, a rank that
-             * owns a window uses the direct path, which is exact at ~15% less
-             * prefill throughput (157.8 -> 135.0 t/s on one node). */
-            !owned_filtered;
+            !disable_resident_iq2_sorted;
         const uint32_t use_expert_tiles = use_sorted_pairs;
         const uint32_t expert_tile_m = n_tokens <= 8u ? 4u : 8u;
         const uint32_t write_gate_up = 0u;
@@ -1919,7 +1933,8 @@ static int routed_moe_launch(
                             out, down, mid, iq2_hot_mid_h, use_iq2_hot_f16_mid, down_w,
                             sorted_counts, sorted_offsets, sorted_pairs, tile_experts,
                             n_tokens, n_total_expert, n_expert, expert_mid_dim, out_dim,
-                            down_expert_bytes, down_row_bytes);
+                            down_expert_bytes, down_row_bytes,
+                            (const int32_t *)selected_exec->ptr, owned_filtered);
                 }
             } else {
             dim3 dgrid((out_dim + 31u) / 32u, pair_count, 1);
@@ -2132,7 +2147,13 @@ static int routed_moe_launch(
         if (ok && !direct_iq2_down_done && !use_atomic_down &&
             !use_direct_down_sum6 && !use_iq2_q2_float_down) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            if (owned_filtered) {
+                moe_sum_owned_kernel<<<(n + 255) / 256, 256>>>(
+                        (float *)out->ptr, (const float *)down->ptr,
+                        (const int32_t *)selected_exec->ptr, out_dim, n_expert, n_tokens);
+            } else {
+                moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            }
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
@@ -2463,14 +2484,32 @@ static int routed_moe_launch(
 #endif
         const uint64_t n = (uint64_t)n_tokens * out_dim;
         if (moe_wmma_hot) {
+            const int32_t *owned_ids =
+                owned_filtered ? (const int32_t *)selected_exec->ptr : NULL;
             if ((out_dim & 1u) == 0u) {
                 const uint64_t n2 = n >> 1u;
-                moe_sum_f16x2_kernel<<<(n2 + 255u) / 256u, 256>>>(
-                        (float *)out->ptr, wmma_down_h, out_dim, n_expert, n_tokens);
+                if (owned_ids) {
+                    moe_sum_owned_f16x2_kernel<<<(n2 + 255u) / 256u, 256>>>(
+                            (float *)out->ptr, wmma_down_h, owned_ids,
+                            out_dim, n_expert, n_tokens);
+                } else {
+                    moe_sum_f16x2_kernel<<<(n2 + 255u) / 256u, 256>>>(
+                            (float *)out->ptr, wmma_down_h, out_dim, n_expert, n_tokens);
+                }
             } else {
-                moe_sum_f16_kernel<<<(n + 255u) / 256u, 256>>>(
-                        (float *)out->ptr, wmma_down_h, out_dim, n_expert, n_tokens);
+                if (owned_ids) {
+                    moe_sum_owned_f16_kernel<<<(n + 255u) / 256u, 256>>>(
+                            (float *)out->ptr, wmma_down_h, owned_ids,
+                            out_dim, n_expert, n_tokens);
+                } else {
+                    moe_sum_f16_kernel<<<(n + 255u) / 256u, 256>>>(
+                            (float *)out->ptr, wmma_down_h, out_dim, n_expert, n_tokens);
+                }
             }
+        } else if (owned_filtered) {
+            moe_sum_owned_kernel<<<(n + 255u) / 256u, 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr,
+                    (const int32_t *)selected_exec->ptr, out_dim, n_expert, n_tokens);
         } else {
             moe_sum_kernel<<<(n + 255u) / 256u, 256>>>(
                     (float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
@@ -2864,7 +2903,13 @@ static int routed_moe_launch(
     }
     if (ok) {
         uint64_t n = (uint64_t)n_tokens * out_dim;
-        moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+        if (owned_filtered) {
+            moe_sum_owned_kernel<<<(n + 255) / 256, 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr,
+                    (const int32_t *)selected_exec->ptr, out_dim, n_expert, n_tokens);
+        } else {
+            moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+        }
         ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
     }
     if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();

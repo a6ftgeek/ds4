@@ -3940,6 +3940,81 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     out[gid] = acc;
 }
 
+/* Expert ownership (network TP): a peer-owned pair never enters a sorted
+ * bucket, so its row in the per-pair `down` scratch still holds the previous
+ * call's data and must not be summed.  These mirror CUDA's moe_sum_owned_kernel
+ * (ds4_cuda.cu) and add only the slots whose filtered id is >= 0, so the two
+ * ranks' half-sums add up to the unfiltered result. */
+__global__ static void moe_sum_owned_kernel(
+        float *out,
+        const float *down,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    const uint32_t tok = (uint32_t)(gid / out_dim);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim);
+    float acc = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = (uint64_t)tok * n_expert + slot;
+        if (selected[pair] < 0) continue;
+        acc += down[pair * out_dim + row];
+    }
+    out[gid] = acc;
+}
+
+__global__ static void moe_sum_owned_f16_kernel(
+        float *out,
+        const half *down_h,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    const uint32_t tok = (uint32_t)(gid / out_dim);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim);
+    float acc = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = (uint64_t)tok * n_expert + slot;
+        if (selected[pair] < 0) continue;
+        acc += __half2float(down_h[pair * out_dim + row]);
+    }
+    out[gid] = acc;
+}
+
+__global__ static void moe_sum_owned_f16x2_kernel(
+        float *out,
+        const half *down_h,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t out_dim2 = out_dim >> 1u;
+    const uint64_t n2 = (uint64_t)n_tokens * out_dim2;
+    if (gid >= n2) return;
+    const uint32_t tok = (uint32_t)(gid / out_dim2);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim2) << 1u;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = (uint64_t)tok * n_expert + slot;
+        if (selected[pair] < 0) continue;
+        const uint64_t off = pair * out_dim + row;
+        const float2 v = __half22float2(*reinterpret_cast<const __half2 *>(down_h + off));
+        acc0 += v.x;
+        acc1 += v.y;
+    }
+    const uint64_t out_off = (uint64_t)tok * out_dim + row;
+    out[out_off] = acc0;
+    out[out_off + 1u] = acc1;
+}
+
 __global__ static void moe_sum_f16_kernel(float *out, const half *down_h, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * out_dim;

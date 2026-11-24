@@ -1,0 +1,43 @@
+[Unit]
+Description=DS4 TP=4 inference service (DeepSeek-V4.1-Flash Q4, USB4 RDMA ring, 1M ctx)
+Documentation=file:///home/node_one/dev/ds4-v41-pp/src/dsbench/usb4-rdma/ROCM_TP_REPORT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=node_one
+Group=node_one
+# Rootless podman/toolbox need the user's runtime dir; linger is enabled for
+# node_one so /run/user/1000 exists without an interactive login.
+Environment=HOME=/home/node_one
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=CTX=1048576
+Environment=BIND=0.0.0.0
+Environment=PORT=8000
+Environment=RING_PORT=19730
+Environment=VISION=1
+Environment=TP_CORE=2
+Environment=LOGDIR=/var/tmp/ds4-tp4
+Environment=LOG_MODE=journal
+Environment=START_TIMEOUT=900
+WorkingDirectory=/home/node_one/dev/ds4-v41-pp/src
+# The launcher starts ranks 1-3 on node2-4 over passwordless ssh, then rank 0
+# (ds4-server) here, waits for /v1/models, and stays in the foreground.
+ExecStart=/usr/bin/bash /home/node_one/dev/ds4-v41-pp/src/dsbench/usb4-rdma/launch_tp4_best.sh start
+ExecStop=/usr/bin/bash /home/node_one/dev/ds4-v41-pp/src/dsbench/usb4-rdma/launch_tp4_best.sh stop
+TimeoutStartSec=1200
+TimeoutStopSec=180
+Restart=on-failure
+RestartSec=20
+KillMode=mixed
+TasksMax=infinity
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ds4-tp4
+
+[Install]
+WantedBy=multi-user.target

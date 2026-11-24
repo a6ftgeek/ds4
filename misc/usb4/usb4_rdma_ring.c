@@ -62,6 +62,23 @@
 #define TB_DEV_DIR "/sys/bus/thunderbolt/devices"
 #define IB_CLASS_DIR "/sys/class/infiniband"
 
+/* Local ACK timeout is 4.096 us * 2^timeout. The IB default of 14 is 67 ms,
+ * which is far more tolerance than a point-to-point Thunderbolt cable needs,
+ * and a cold path pays it as a single ~67 ms stall (the driver logs "native
+ * retransmit reason=1") whenever two collectives are separated by real work --
+ * exactly the shape of a TP data path, where GPU compute sits between
+ * all-reduces. 8 is 1.05 ms. USB4_RING_QP_TIMEOUT overrides the value so the
+ * two settings can be compared on the same hardware. */
+static int usb4_ring_qp_ack_timeout(void) {
+    const char *v = getenv("USB4_RING_QP_TIMEOUT");
+    if (v && v[0]) {
+        char *end = NULL;
+        long t = strtol(v, &end, 10);
+        if (end != v && *end == '\0' && t >= 0 && t <= 31) return (int)t;
+    }
+    return 8;
+}
+
 struct peerinfo {
     uint32_t qpn;
     uint32_t rkey;
@@ -922,7 +939,7 @@ static int qp_to_rts(struct ibv_qp *qp) {
     struct ibv_qp_attr at;
     memset(&at, 0, sizeof at);
     at.qp_state = IBV_QPS_RTS;
-    at.timeout = 14;
+    at.timeout = (uint8_t)usb4_ring_qp_ack_timeout();
     at.retry_cnt = 7;
     at.rnr_retry = 7;
     at.sq_psn = 0;
@@ -1251,23 +1268,33 @@ int usb4_rdma_ring_init(struct usb4_rdma_ring **ring_out,
     if (warm == 0) warm = 2;      /* default on */
     if (warm < 0) warm = 0;       /* explicit opt-out */
     if (warm > 0) {
-        unsigned char dummy[64];
-        memset(dummy, (unsigned char)(r->rank + 1), sizeof dummy);
+        /* Warm up at the real per-rank chunk size: the one-off path bring-up
+         * and the driver's per-peer credit/MTU state are size-sensitive, so a
+         * tiny dummy message can leave the first full-size call exposed. */
+        unsigned char *dummy = malloc(r->chunk_bytes);
+        if (!dummy) {
+            rerr(r->rank, "warmup buffer allocation failed\n");
+            ring_free(r);
+            return USB4_RDMA_RING_ERR_SYS;
+        }
+        memset(dummy, (unsigned char)(r->rank + 1), r->chunk_bytes);
         for (int i = 0; i < warm; i++) {
             double t0 = now_s();
             st = usb4_rdma_ring_all_reduce((struct usb4_rdma_ring *)r, dummy,
-                                           sizeof dummy,
+                                           r->chunk_bytes,
                                            USB4_RDMA_RING_DTYPE_U8,
                                            USB4_RDMA_RING_OP_SUM);
             if (st != USB4_RDMA_RING_OK) {
                 rerr(r->rank, "warmup all_reduce %d/%d failed (status %d)\n",
                      i + 1, warm, st);
+                free(dummy);
                 ring_free(r);
                 return st;
             }
             rlog(r->rank, r->verbose, "warmup %d/%d took %.1f ms\n",
                  i + 1, warm, (now_s() - t0) * 1e3);
         }
+        free(dummy);
     }
 
     if (info) {
@@ -1404,6 +1431,7 @@ int usb4_rdma_ring_all_gather(struct usb4_rdma_ring *r, const void *sendbuf,
     size_t es = dtype_size(dtype);
     if (es == 0) return USB4_RDMA_RING_ERR_INVAL;
     if (count > SIZE_MAX / es) return USB4_RDMA_RING_ERR_INVAL;
+    if (count > SIZE_MAX / ((size_t)r->world * es)) return USB4_RDMA_RING_ERR_INVAL;
     size_t chunk_elems = r->chunk_bytes / es;
     if (chunk_elems == 0) return USB4_RDMA_RING_ERR_INVAL;
 

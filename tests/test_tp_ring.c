@@ -223,6 +223,62 @@ int main(int argc, char **argv) {
         free(buf);
     }
 
+    /* 6. Idle-separated collectives. Real inference puts GPU compute between
+     *    consecutive all-reduces, so the ring goes cold between calls. A stall
+     *    bound by the QP ACK timeout shows up here and nowhere in the
+     *    back-to-back sweep above, which is the whole point of this block. */
+    {
+        const size_t count = (256u << 10) / sizeof(float);
+        float *buf = malloc(count * sizeof(float));
+        if (!buf) return 1;
+        for (size_t i = 0; i < count; i++) buf[i] = (float)(rank + 1);
+        const int rounds = 10;
+        /* Gap between collectives, in ms. 5 ms is the shape of a layer; larger
+         * values test whether a genuinely cold Thunderbolt path behaves
+         * differently. Override with TEST_RING_GAP_MS. */
+        long gap_ms = 5;
+        {
+            const char *g = getenv("TEST_RING_GAP_MS");
+            if (g && g[0]) {
+                char *end = NULL;
+                long v = strtol(g, &end, 10);
+                if (end != g && *end == '\0' && v >= 0 && v <= 5000) gap_ms = v;
+            }
+        }
+        double warm_sum = 0, warm_worst = 0, back_sum = 0, back_worst = 0;
+        for (int i = 0; i < rounds; i++) {
+            struct timespec gap = {.tv_sec = gap_ms / 1000,
+                                   .tv_nsec = (gap_ms % 1000) * 1000 * 1000};
+            nanosleep(&gap, NULL);
+            const double a = now_sec();
+            if (ds4_tp_ring_all_reduce(ring, buf, count, DS4_TP_RING_DTYPE_F32,
+                                       DS4_TP_RING_OP_SUM, err, sizeof(err)) != 0) {
+                fprintf(stderr, "  separated all_reduce failed: %s\n", err);
+                failures++;
+                break;
+            }
+            const double el = now_sec() - a;
+            warm_sum += el;
+            if (el > warm_worst) warm_worst = el;
+        }
+        for (int i = 0; i < rounds; i++) {
+            const double a = now_sec();
+            if (ds4_tp_ring_all_reduce(ring, buf, count, DS4_TP_RING_DTYPE_F32,
+                                       DS4_TP_RING_OP_SUM, err, sizeof(err)) != 0) {
+                failures++;
+                break;
+            }
+            const double el = now_sec() - a;
+            back_sum += el;
+            if (el > back_worst) back_worst = el;
+        }
+        printf("  256 KB all_reduce: idle-separated mean %.3f ms max %.3f ms | "
+               "back-to-back mean %.3f ms max %.3f ms (%d rounds each)\n",
+               warm_sum / rounds * 1e3, warm_worst * 1e3,
+               back_sum / rounds * 1e3, back_worst * 1e3, rounds);
+        free(buf);
+    }
+
     ds4_tp_ring_destroy(ring);
     printf("rank %d: %s (%d failure%s)\n", rank, failures ? "FAIL" : "PASS",
            failures, failures == 1 ? "" : "s");

@@ -22,6 +22,12 @@
  *
  * All ranks must call the collective functions in the same order with the same
  * count/dtype/op. A ring object is not thread-safe.
+ *
+ * NOTE (measured on this cluster): the USB4 link may take up to one QP ACK
+ * timeout (~67 ms) to deliver the first write after the ring has been idle for
+ * several milliseconds. Back-to-back collectives show no such stalls; callers
+ * that interleave long compute gaps should expect an occasional one-off
+ * wake-up penalty on the first collective after the gap.
  */
 #ifndef USB4_RDMA_RING_H
 #define USB4_RDMA_RING_H

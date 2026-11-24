@@ -76161,6 +76161,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
             e->tp.rank, e->tp.v41_balanced_route ? "balanced selected experts" :
                         e->cuda_tp_expert_split ? "MXFP4 expert intermediate split" :
                                                "50/50 expert ownership",
+            ds4_tp_is_usb4_ring(tp) ? "usb4-rdma" :
             ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
     return 1;
 fail:

@@ -189,8 +189,9 @@ int main(int argc, char **argv) {
         free(buf);
     }
 
-    /* 5. Timing sweep over the prefill/decode payload range. Reported, never
-     *    used as a pass/fail gate: a slow link is not a correctness failure. */
+    /* 5. Correctness and timing sweep over the prefill/decode payload range.
+     *    The first call at each size is checked exactly; the 20 iterations
+     *    after it are reported, never used as a pass/fail gate beyond that. */
     static const size_t sizes[] = {4u << 10, 16u << 10, 64u << 10, 256u << 10,
                                    1u << 20};
     const int iters = 20;
@@ -201,10 +202,13 @@ int main(int argc, char **argv) {
         float *buf = malloc(bytes);
         if (!buf) return 1;
         for (size_t i = 0; i < count; i++) buf[i] = (float)(rank + 1);
-        /* One unmeasured round: the ring is already warm, but the first touch
-         * of a fresh buffer is not representative. */
-        (void)ds4_tp_ring_all_reduce(ring, buf, count, DS4_TP_RING_DTYPE_F32,
-                                     DS4_TP_RING_OP_SUM, err, sizeof(err));
+        int ok = ds4_tp_ring_all_reduce(ring, buf, count, DS4_TP_RING_DTYPE_F32,
+                                        DS4_TP_RING_OP_SUM, err, sizeof(err)) == 0;
+        if (ok) ok = check_f32_sum(buf, count, world) == 0;
+        if (!ok) failures++;
+        printf("  %6zu B count=%6zu: correct=%s\n", bytes, count, ok ? "YES" : "NO");
+        /* Refill and time; the ring is already warm at this size. */
+        for (size_t i = 0; i < count; i++) buf[i] = (float)(rank + 1);
         double t0 = now_sec(), worst = 0;
         for (int i = 0; i < iters; i++) {
             double a = now_sec();

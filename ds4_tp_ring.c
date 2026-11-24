@@ -567,9 +567,13 @@ static int ring_validate(const ds4_tp_ring_options *opt, char *err,
         }
     }
     if ((opt->right_dev && !opt->left_dev) || (!opt->right_dev && opt->left_dev)) {
-        ring_set_err(err, errlen,
-                     "ring: set both device overrides or neither");
-        return -1;
+        /* world=2 has one peer, so one device override is enough: it is the
+         * same HCA in both ring directions. Larger rings must name both. */
+        if (opt->world != 2) {
+            ring_set_err(err, errlen,
+                         "ring: set both device overrides or neither");
+            return -1;
+        }
     }
     return 0;
 }
@@ -579,12 +583,23 @@ int ds4_tp_ring_create(ds4_tp_ring **out, const ds4_tp_ring_options *opt,
     if (out) *out = NULL;
     if (ring_validate(opt, err, errlen) != 0) return -1;
 
+    /* At world=2 the right and left neighbour are the same peer, so the same
+     * HCA plays both roles. Mirror a single override instead of letting the
+     * two halves of the library pick different devices. */
+    ds4_tp_ring_options normalized = *opt;
+    if (normalized.world == 2) {
+        if (normalized.right_dev && !normalized.left_dev)
+            normalized.left_dev = normalized.right_dev;
+        else if (normalized.left_dev && !normalized.right_dev)
+            normalized.right_dev = normalized.left_dev;
+    }
+
     ds4_tp_ring *r = calloc(1, sizeof(*r));
     if (!r) {
         ring_set_err(err, errlen, "ring: out of memory");
         return -1;
     }
-    r->opt = *opt;
+    r->opt = normalized;
     r->rank = opt->rank;
     r->world = opt->world;
     r->right_fd = r->left_fd = r->listen_fd = -1;
@@ -656,6 +671,22 @@ int ds4_tp_ring_create(ds4_tp_ring **out, const ds4_tp_ring_options *opt,
              * peers driving a different transport. */
             ring_set_err(err, errlen, "ring: USB4 RDMA init failed: %s",
                          usb4_rdma_ring_strerror(rc));
+            ring_close_sockets(r);
+            free(r);
+            return -1;
+        }
+        /* world=2 is degenerate: both ring directions must be the one HCA that
+         * faces the only peer. A split here would mean discovery matched two
+         * different XDomains and the data plane would silently use the wrong
+         * link. */
+        if (r->world == 2 &&
+            strcmp(r->usb4_info.right_dev, r->usb4_info.left_dev) != 0) {
+            ring_set_err(err, errlen,
+                         "ring: world=2 resolved right=%s left=%s; both ring "
+                         "directions must use the same HCA",
+                         r->usb4_info.right_dev, r->usb4_info.left_dev);
+            usb4_rdma_ring_destroy(r->usb4);
+            r->usb4 = NULL;
             ring_close_sockets(r);
             free(r);
             return -1;

@@ -104,6 +104,11 @@ void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+/* True when the bulk gate payloads move over the USB4 RDMA ring
+ * (--transport usb4-rdma). Control frames and gate headers still use TCP, so
+ * this is distinct from ds4_tp_is_rdma(), which means the native two-sided
+ * verbs path. */
+bool ds4_tp_is_usb4_ring(const ds4_tp *tp);
 /* True once both peers agreed on the RDMA command mailbox (RC queue pairs,
  * not disabled with DS4_TP_DISABLE_RDMA_MAILBOX on either rank). */
 bool ds4_tp_command_mailbox_active(const ds4_tp *tp);

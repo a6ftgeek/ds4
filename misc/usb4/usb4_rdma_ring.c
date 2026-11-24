@@ -844,10 +844,12 @@ static void ring_free(struct usb4_rdma_ring *r) {
     if (r->icq) ibv_destroy_cq(r->icq);
     if (r->smr) ibv_dereg_mr(r->smr);
     if (r->rmr) ibv_dereg_mr(r->rmr);
+    /* At world=2 both roles resolve to the same HCA, so the context and PD are
+     * shared and must be released once. */
+    if (r->lpd && r->lpd != r->rpd) ibv_dealloc_pd(r->lpd);
     if (r->rpd) ibv_dealloc_pd(r->rpd);
-    if (r->lpd) ibv_dealloc_pd(r->lpd);
+    if (r->lc && r->lc != r->rc) ibv_close_device(r->lc);
     if (r->rc) ibv_close_device(r->rc);
-    if (r->lc) ibv_close_device(r->lc);
     if (r->lfd >= 0) close(r->lfd);
     if (r->send_fd >= 0) close(r->send_fd);
     if (r->acc_fd >= 0) close(r->acc_fd);
@@ -1053,20 +1055,32 @@ int usb4_rdma_ring_init(struct usb4_rdma_ring **ring_out,
         return USB4_RDMA_RING_ERR_NO_DEVICE;
     }
     r->rc = ibv_open_device(rd);
-    r->lc = ibv_open_device(ld);
+    /* Degenerate ring (world=2): rank r's right and left neighbour are the same
+     * peer, so both roles resolve to the same HCA. Open it once and share the
+     * ibv_context and PD; the out and in QPs then live on one device, each with
+     * its own CQ, which is what the USB4 driver needs to see. Opening the same
+     * device twice is both wasteful and provider-dependent. */
+    const int same_dev = (rd == ld) || !strcmp(r->right_dev, r->left_dev);
+    if (r->rc && !same_dev) r->lc = ibv_open_device(ld);
+    else if (r->rc) r->lc = r->rc;
     ibv_free_device_list(list);
     if (!r->rc || !r->lc) {
-        rerr(r->rank, "ibv_open_device failed\n");
+        rerr(r->rank, "ibv_open_device failed%s\n", same_dev ? " (shared HCA)" : "");
         ring_free(r);
         return USB4_RDMA_RING_ERR_SYS;
     }
     r->rpd = ibv_alloc_pd(r->rc);
-    r->lpd = ibv_alloc_pd(r->lc);
+    r->lpd = same_dev ? r->rpd : ibv_alloc_pd(r->lc);
     if (!r->rpd || !r->lpd) {
         rerr(r->rank, "ibv_alloc_pd failed\n");
         ring_free(r);
         return USB4_RDMA_RING_ERR_SYS;
     }
+    if (same_dev)
+        rlog(r->rank, r->verbose,
+             "world=%d: right and left are both rank %d, sharing HCA %s "
+             "(one context/PD, two QPs)\n",
+             r->world, r->right, r->right_dev);
 
     struct ibv_port_attr pattr;
     if (ibv_query_port(r->rc, 1, &pattr) != 0) {

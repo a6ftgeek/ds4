@@ -105,6 +105,12 @@ layer-scale gaps.
 
 ## DS4 inference: NOT MEASURED, and why
 
+> **Update 2026-11-23:** the backend gate described in this section was lifted
+> (`fdf2222`, `792508c`) and 2-node TP now runs on this cluster. The transport
+> comparison and its numbers are in **World=2: the degenerate ring as the TP=2
+> payload plane** at the end of this document. The history below is kept because
+> it explains why the first, transport-only change stopped where it did.
+
 A 2-node TCP-vs-RDMA inference comparison was attempted and **could not run**:
 `ds4_tp_validate_engine_options` rejects network tensor parallelism on any
 backend that is not Metal or CUDA (`ds4_tp.c:778-785`):
@@ -186,18 +192,67 @@ Options: `--transport usb4-rdma`, `--tp-world-size N`, `--tp-ring-ip ADDR`
 
 ## NOT verified
 
-* **Any DS4 inference metric** — blocked by the backend gate above, not by
-  weights.
-* **N-rank TP end to end** — the sharding is 2-rank.
-* **`--transport usb4-rdma` through the `ds4` binary** — unreachable until
-  world>2 is supported; exercised by `tests/test_tp_ring` instead.
+* **Any DS4 inference metric** — this document's original numbers predate the
+  ROCm TP backend; the 2-node numbers are in the world=2 section below.
+* **N-rank TP end to end** — the sharding is still 2-rank.
+* **`--transport usb4-rdma` above world=2** — allowed and measured at world=2
+  only; larger worlds remain refused by the sharding gate.
 * **Full `make strix-halo` on the other nodes** — the ring seam builds on all
   four nodes (0 warnings, both modes); the full tree build was done on one host
   only, because that is where the checkout lives.
 * **Mixed `USE_USB4_RDMA` settings across ranks** — unsupported; every rank
   must use the same build setting.
 * **Long-run stability** — the microbenchmarks are 20 iterations per size and
-  10 rounds per gap setting, not a soak test.
+  10 rounds per gap setting, not a soak test, and the TP=2 run is 16 generated
+  tokens.
+
+## World=2: the degenerate ring as the TP=2 payload plane
+
+`--transport usb4-rdma` is allowed at world=2, which is the only world the
+sharding supports (larger worlds are still refused for the reasons above). Rank
+0's right and left neighbour are both rank 1, so both ring directions resolve
+to the same HCA. `usb4_rdma_ring.c` opens that device once and shares the
+`ibv_context` and PD, then creates two QPs — `out` for the writes to the peer
+and `in` for the peer's writes — each with its own CQ. The discovery path
+already accepts one XDomain playing both roles. The TCP control ring, the gate
+headers and the command mailbox stay on the 5GbE sockets; only the bulk gate
+payload moves over the ring, which is the split the driver supports.
+
+Isolated two-node (`node1`+`node2`) test, 512 KiB chunk; `correct=YES` on both
+ranks at every size, including the unaligned 1,000,003-element F32 case:
+
+| Size | all_reduce |
+|---|---|
+| 4 KB | 0.042 ms / 0.79 Gbps |
+| 16 KB | 0.059 ms / 2.21 Gbps |
+| 64 KB | 0.119 ms / 4.42 Gbps |
+| 256 KB | 0.332 ms / 6.32 Gbps |
+| 1 MB | 1.125 ms / 7.46 Gbps |
+
+DS4 TP=2, `ctx 2048`, greedy, 16 tokens, `--tp-cpu-core 8`:
+
+| | TP=1 | TP=2 TCP | TP=2 USB4 RDMA |
+|---|---|---|---|
+| prefill t/s | 92.12 | 88.59 | 89.31 |
+| decode t/s | 16.93 | 10.17 | 10.21 |
+| ms/token | 59.1 | 98.3 | 97.9 |
+| whole gate exchange | — | 129.8 us | 104.7 us |
+| payload per gate | — | ~110 us | 60.5 us |
+| resident model/rank | 80.76 GiB | 44.48 GiB | 44.48 GiB |
+| GTT peak/rank | 87.88 GiB | 55.97 GiB | 55.97 GiB |
+
+The greedy 16-token text is byte-identical across all three configurations.
+
+The ~900 us/layer implied by the 10.17 t/s vs 16.93 t/s delta is **not** the
+exchange: the measured whole gate exchange is 130 us/layer over TCP and 105
+us/layer over USB4, so ~780 us/layer sits outside the exchange (per-rank
+compute / MoE efficiency at the 50/50 expert split, not the link). USB4 RDMA
+removes ~25 us/layer, about 1 ms/token — real, but far too small to close the
+gap. Two practical requirements came out of this: the RDMA busy-poll thread
+must be pinned (`--tp-cpu-core`), because otherwise scheduling gaps stretch the
+tail to ~10 ms and decode falls to 6.43 t/s; and 512 KiB is the largest chunk
+that fits the container's 8 MiB `RLIMIT_MEMLOCK` (4 MiB fails `ibv_reg_mr` with
+`ENOMEM`).
 
 ## Two cluster-facing caveats
 

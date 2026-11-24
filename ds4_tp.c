@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
@@ -28,6 +29,7 @@
 
 #include "ds4_tp.h"
 #include "ds4_gpu.h"
+#include "ds4_tp_ring.h"
 
 #if (defined(__APPLE__) || defined(__linux__)) && defined(__has_include)
 #if __has_include(<infiniband/verbs.h>)
@@ -237,6 +239,14 @@ static uint32_t tp_rdma_negotiate_max_msg(uint32_t local, uint32_t peer) {
 }
 #endif
 
+typedef struct {
+    uint64_t n;
+    size_t bytes;
+    double sum;
+    double max;
+    uint32_t hist[32];          /* log2(us) buckets */
+} tp_xchg_stat;
+
 struct ds4_tp {
     ds4_tp_options opt;
     int rank;                   /* 0 leader, 1 worker */
@@ -278,6 +288,16 @@ struct ds4_tp {
     uint64_t gate_timeout_ms;
     atomic_bool failed;
     uint64_t sync_checkpoint_seq;
+    /* USB4 RDMA payload plane (--transport usb4-rdma). Control frames, gate
+     * headers and the command mailbox stay on the TCP sockets; only the bulk
+     * gate payloads move over the one-sided ring, which is the split the USB4
+     * driver supports (RDMA WRITE only, no receive WQEs). */
+    ds4_tp_ring *ring;
+    unsigned char *ring_stage;
+    size_t ring_stage_bytes;
+    int xchg_stats;             /* DS4_TP_XCHG_STATS=1 */
+    tp_xchg_stat xchg[2];       /* payload only: 0 = decode/verify, 1 = prefill */
+    tp_xchg_stat gate[2];       /* whole gate call, header rendezvous included */
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
 #endif
@@ -305,6 +325,66 @@ static void tp_set_err(char *err, size_t errlen, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(err, errlen, fmt, ap);
     va_end(ap);
+}
+
+/* Per-exchange latency accounting for the two bulk payload transports. Class 0
+ * is the decode/verify payload size (at most 8 rows of the hidden vector) and
+ * class 1 is the much larger prefill gate payload, so their means are not
+ * mixed. The histogram makes percentiles cheap without keeping every sample. */
+static void tp_xchg_note(ds4_tp *tp, double sec, size_t bytes) {
+    if (!tp || sec < 0.0) return;
+    const int cls = bytes <= (size_t)8u * tp->vec_bytes ? 0 : 1;
+    tp_xchg_stat *s = &tp->xchg[cls];
+    s->n++;
+    s->bytes += bytes;
+    s->sum += sec;
+    if (sec > s->max) s->max = sec;
+    double us = sec * 1e6;
+    int b = 0;
+    while (b < 31 && us >= (double)(1u << (b + 1))) b++;
+    s->hist[b]++;
+}
+
+static void tp_xchg_report_one(const char *label, const tp_xchg_stat *s) {
+    if (!s || s->n == 0) return;
+    uint64_t seen = 0, p50 = 0, p99 = 0;
+    for (int b = 0; b < 32; b++) {
+        seen += s->hist[b];
+        if (!p50 && seen * 2 >= s->n) p50 = 1ull << (b + 1);
+        if (!p99 && seen * 100 >= s->n * 99ull) p99 = 1ull << (b + 1);
+    }
+    fprintf(stderr,
+            "ds4-tp: payload exchange %s: n=%llu bytes=%zu mean=%.1f us "
+            "p50<=%llu us p99<=%llu us max=%.1f us\n",
+            label, (unsigned long long)s->n, s->bytes,
+            s->sum / (double)s->n * 1e6,
+            (unsigned long long)p50, (unsigned long long)p99, s->max * 1e6);
+}
+
+static void tp_xchg_report(const ds4_tp *tp) {
+    if (!tp || !tp->xchg_stats) return;
+    tp_xchg_report_one("payload decode/verify", &tp->xchg[0]);
+    tp_xchg_report_one("payload prefill", &tp->xchg[1]);
+    tp_xchg_report_one("whole gate decode/verify (header+payload)",
+                       &tp->gate[0]);
+    tp_xchg_report_one("whole gate prefill/verify-batch (header+payload)",
+                       &tp->gate[1]);
+}
+
+/* Whole-call timing: the header exchange is the lockstep rendezvous, so this is
+ * what a layer actually pays, as opposed to the payload transfer alone. */
+static void tp_gate_note(ds4_tp *tp, double sec, size_t bytes) {
+    if (!tp || !tp->xchg_stats || sec < 0.0) return;
+    const int cls = bytes <= (size_t)8u * tp->vec_bytes ? 0 : 1;
+    tp_xchg_stat *s = &tp->gate[cls];
+    s->n++;
+    s->bytes += bytes;
+    s->sum += sec;
+    if (sec > s->max) s->max = sec;
+    double us = sec * 1e6;
+    int b = 0;
+    while (b < 31 && us >= (double)(1u << (b + 1))) b++;
+    s->hist[b]++;
 }
 
 static int tp_write_full(int fd, const void *buf, size_t len) {
@@ -436,6 +516,59 @@ static int tp_tcp_exchange(ds4_tp *tp, ds4_tp_gate_header *header,
     if (changed && fcntl(tp->data_fd, F_SETFL, flags) < 0) return 0;
     errno = saved_errno;
 #endif
+    return ok;
+}
+
+/* ------------------------------------------------------- USB4 ring payload */
+
+/* Move one bulk gate payload over the USB4 RDMA ring: each rank contributes
+ * `bytes` and receives the peer's contribution. ds4_tp_ring_all_gather gives
+ * [rank0 | rank1], so the peer's copy is the other half. Only used at world=2,
+ * where both neighbours are the same peer. */
+static int tp_ring_exchange(ds4_tp *tp, const void *out, void *in, size_t bytes,
+                            char *err, size_t errlen) {
+    if (!tp->ring || bytes == 0) {
+        tp_set_err(err, errlen, "ring payload exchange without a ring or payload");
+        return 0;
+    }
+    if (bytes > SIZE_MAX / 2u) {
+        tp_set_err(err, errlen, "ring payload exchange: %zu bytes is too large", bytes);
+        return 0;
+    }
+    const size_t need = bytes * 2u;
+    if (tp->ring_stage_bytes < need) {
+        void *p = realloc(tp->ring_stage, need);
+        if (!p) {
+            tp_set_err(err, errlen, "ring payload staging allocation (%zu bytes) failed",
+                       need);
+            return 0;
+        }
+        tp->ring_stage = p;
+        tp->ring_stage_bytes = need;
+    }
+    if (ds4_tp_ring_all_gather(tp->ring, out, tp->ring_stage, bytes,
+                               DS4_TP_RING_DTYPE_U8, err, errlen) != 0)
+        return 0;
+    const int peer = tp->rank == 0 ? 1 : 0;
+    memcpy(in, tp->ring_stage + (size_t)peer * bytes, bytes);
+    return 1;
+}
+
+/* The single point where a bulk gate payload leaves the node. Keeping the
+ * header exchange outside this helper lets both transports pay the same
+ * rendezvous cost and makes the measured latency the transfer itself. */
+static int tp_payload_exchange(ds4_tp *tp, const void *out, void *in, size_t bytes,
+                               char *err, size_t errlen) {
+    const double t0 = tp->xchg_stats ? tp_now_sec() : 0.0;
+    char ring_err[256] = "";
+    int ok;
+    if (tp->ring) ok = tp_ring_exchange(tp, out, in, bytes, ring_err, sizeof(ring_err));
+    else ok = tp_tcp_exchange(tp, NULL, NULL, out, in, bytes);
+    if (!ok && ring_err[0]) {
+        if (err) tp_set_err(err, errlen, "%s", ring_err);
+        fprintf(stderr, "ds4-tp: %s\n", ring_err);
+    }
+    if (ok && tp->xchg_stats) tp_xchg_note(tp, tp_now_sec() - t0, bytes);
     return ok;
 }
 
@@ -769,12 +902,9 @@ int ds4_tp_validate_engine_options(
                    opt->tp.world_size);
         return 0;
     }
-    if (opt->tp.transport == DS4_TP_TRANSPORT_USB4_RDMA) {
-        tp_set_err(err, errlen,
-                   "tp: --transport usb4-rdma needs --tp-world-size above 2; "
-                   "use --transport rdma for a 2-rank pair");
-        return 0;
-    }
+    /* --transport usb4-rdma is allowed at world=2: the payload plane is the
+     * degenerate 2-rank USB4 ring (tp_ring_start). world>2 is still refused
+     * above by the sharding gate. */
     bool supported_backend = opt->backend == DS4_BACKEND_METAL;
 #if !defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* ROCm presents DS4_BACKEND_CUDA (see ds4_backend_uses_graph in ds4.c), so
@@ -2475,8 +2605,12 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     memcpy(tp->gate_slot_mask, id->gate_slot_mask,
            sizeof(tp->gate_slot_mask));
     tp_slab_layout(tp);
-    /* Transport decision: RDMA only when both sides can. */
-    int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
+    /* Transport decision: the native two-sided RDMA path only for auto/rdma.
+     * usb4-rdma keeps rdma_active false and moves just the gate payloads over
+     * the one-sided USB4 ring (see tp_ring_start), because the USB4 driver
+     * cannot sustain two-sided SEND/RECV. */
+    int want_rdma = tp->opt.transport == DS4_TP_TRANSPORT_AUTO ||
+                    tp->opt.transport == DS4_TP_TRANSPORT_RDMA;
     tp->rdma_active = want_rdma && rdma_ok && theirs.rdma_ok;
 #ifdef DS4_TP_HAVE_VERBS
     tp->rdma.max_msg = tp_rdma_negotiate_max_msg(mine.rdma_max_msg, theirs.rdma_max_msg);
@@ -2490,6 +2624,89 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                    rdma_ok ? "the peer" : "this");
         return 0;
     }
+    return 1;
+}
+
+/* --------------------------------------------------- USB4 RDMA payload plane */
+
+/* Bring up the USB4 RDMA ring used by --transport usb4-rdma. Only the bulk
+ * gate payloads move over the ring; control frames, gate headers and the
+ * command mailbox stay on the TCP sockets, because the USB4 driver supports
+ * one-sided RDMA WRITE only (two-sided SEND/RECV hits the RNR bug). The two
+ * control addresses are the connected endpoints' 5GbE addresses, so a
+ * wildcard --listen and hostnames both work; --tp-ring-ip overrides them in
+ * rank order (leader, worker). */
+static int tp_ring_start(ds4_tp *tp, char *err, size_t errlen) {
+    if (tp->opt.world_size != 2) {
+        tp_set_err(err, errlen,
+                   "transport usb4-rdma needs --tp-world-size 2 (got %d): the ring "
+                   "payload plane is 2-rank only", tp->opt.world_size);
+        return 0;
+    }
+    char leader_ip[64] = "", worker_ip[64] = "";
+    if (tp->opt.ring_ip[0] && !tp->opt.ring_ip[1]) {
+        tp_set_err(err, errlen, "transport usb4-rdma: --tp-ring-ip must be "
+                   "passed twice (leader, then worker)");
+        return 0;
+    }
+    if (tp->opt.ring_ip[0] && tp->opt.ring_ip[1]) {
+        snprintf(leader_ip, sizeof(leader_ip), "%s", tp->opt.ring_ip[0]);
+        snprintf(worker_ip, sizeof(worker_ip), "%s", tp->opt.ring_ip[1]);
+    } else {
+        struct sockaddr_in peer_addr, local_addr;
+        socklen_t peer_len = sizeof(peer_addr), local_len = sizeof(local_addr);
+        char peer_ip[64] = "", local_ip[64] = "";
+        if (getpeername(tp->control_fd, (struct sockaddr *)&peer_addr, &peer_len) != 0 ||
+            getsockname(tp->control_fd, (struct sockaddr *)&local_addr, &local_len) != 0 ||
+            peer_addr.sin_family != AF_INET || local_addr.sin_family != AF_INET ||
+            !inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip)) ||
+            !inet_ntop(AF_INET, &local_addr.sin_addr, local_ip, sizeof(local_ip))) {
+            tp_set_err(err, errlen, "transport usb4-rdma: cannot read the control "
+                       "socket addresses; pass --tp-ring-ip twice");
+            return 0;
+        }
+        /* Rank order is leader first, worker second, on both nodes. */
+        snprintf(leader_ip, sizeof(leader_ip), "%s",
+                 tp->rank == 0 ? local_ip : peer_ip);
+        snprintf(worker_ip, sizeof(worker_ip), "%s",
+                 tp->rank == 0 ? peer_ip : local_ip);
+    }
+    if (!leader_ip[0] || !worker_ip[0]) {
+        tp_set_err(err, errlen, "transport usb4-rdma: empty control address");
+        return 0;
+    }
+
+    ds4_tp_ring_options ro;
+    memset(&ro, 0, sizeof(ro));
+    ro.rank = tp->rank;
+    ro.world = 2;
+    ro.control_ip[0] = leader_ip;
+    ro.control_ip[1] = worker_ip;
+    ro.port = tp->rank == 0 ? tp->opt.listen_port : tp->opt.leader_port;
+    ro.gid_index = -1;              /* first IPv4-mapped GID (index 1 here) */
+    /* 512 KiB per rank: the ring registers world*chunk + 8*chunk bytes of host
+     * memory, and the container's RLIMIT_MEMLOCK is 8 MiB, so this is the
+     * largest chunk that both fits the limit and keeps prefill passes few.
+     * (4 MiB fails ibv_reg_mr with ENOMEM; measured, see the ring doc.) */
+    ro.chunk_bytes = 512u << 10;
+    ro.connect_timeout_ms = 0;
+    ro.cpu_core = tp->opt.ring_cpu_core;
+    ro.verbose = getenv("DS4_TP_RING_VERBOSE") != NULL;
+
+    if (ds4_tp_ring_create(&tp->ring, &ro, err, errlen) != 0) return 0;
+    const ds4_tp_ring_backend backend = ds4_tp_ring_get_backend(tp->ring);
+    if (backend != DS4_TP_RING_BACKEND_USB4) {
+        tp_set_err(err, errlen,
+                   "transport usb4-rdma: the ring came up on %s, not USB4 RDMA "
+                   "(rebuild with USE_USB4_RDMA=1 and check the USB4 HCAs/GIDs)",
+                   ds4_tp_ring_backend_name(backend));
+        ds4_tp_ring_destroy(tp->ring);
+        tp->ring = NULL;
+        return 0;
+    }
+    fprintf(stderr, "ds4-tp: payload plane usb4-rdma over USB4 ring: "
+            "leader=%s worker=%s base-port=%d chunk=%zu B\n",
+            leader_ip, worker_ip, ro.port, ro.chunk_bytes);
     return 1;
 }
 
@@ -2507,9 +2724,14 @@ int ds4_tp_create(
         return 0;
     }
     tp->opt = *opt;
+    /* --tp-world-size is optional and documented as defaulting to 2; the field
+     * is only written when the flag is present. Normalize it so the transport
+     * checks see the effective world size. */
+    if (tp->opt.world_size == 0) tp->opt.world_size = 2;
     tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
     tp->control_fd = -1;
     tp->data_fd = -1;
+    tp->xchg_stats = getenv("DS4_TP_XCHG_STATS") != NULL;
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
     if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
@@ -2574,9 +2796,12 @@ int ds4_tp_create(
         }
     }
     if (listener >= 0) close(listener);
+    if (tp->opt.transport == DS4_TP_TRANSPORT_USB4_RDMA) {
+        if (!tp_ring_start(tp, err, errlen)) goto fail;
+    }
     fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
             tp->rank == 0 ? "worker" : "leader",
-            tp->rdma_active ? "rdma" : "tcp",
+            tp->ring ? "usb4-rdma" : tp->rdma_active ? "rdma" : "tcp",
             (unsigned long long)tp->gate_timeout_ms);
     *out = tp;
     return 1;
@@ -2634,6 +2859,14 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
 
 void ds4_tp_free(ds4_tp *tp) {
     if (!tp) return;
+    tp_xchg_report(tp);
+    if (tp->ring) {
+        ds4_tp_ring_destroy(tp->ring);
+        tp->ring = NULL;
+    }
+    free(tp->ring_stage);
+    tp->ring_stage = NULL;
+    tp->ring_stage_bytes = 0;
 #ifdef DS4_TP_HAVE_VERBS
     tp_rdma_close(tp);
 #endif
@@ -2654,6 +2887,7 @@ void ds4_tp_detach_slab(ds4_tp *tp) {
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
+bool ds4_tp_is_usb4_ring(const ds4_tp *tp) { return tp && tp->ring != NULL; }
 #ifndef DS4_TP_HAVE_VERBS
 bool ds4_tp_command_mailbox_active(const ds4_tp *tp) { (void)tp; return false; }
 #endif
@@ -2671,21 +2905,38 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
 
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     if (!tp || ds4_tp_failed(tp)) return 0;
+    const double t_whole = tp->xchg_stats ? tp_now_sec() : 0.0;
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
 #endif
-    /* Send header and payload together without depending on socket capacity. */
     ds4_tp_gate_header h = { DS4_TP_MAGIC, (uint16_t)layer, (uint16_t)gate, seq };
     ds4_tp_gate_header ph;
-    if (!tp_tcp_exchange(tp, &h, &ph,
-            tp->slab + ds4_tp_slab_out_offset(tp, layer, gate),
-            tp->slab + ds4_tp_slab_in_offset(tp, layer, gate), tp->vec_bytes)) return 0;
+    void *out = tp->slab + ds4_tp_slab_out_offset(tp, layer, gate);
+    void *in = tp->slab + ds4_tp_slab_in_offset(tp, layer, gate);
+    if (tp->ring) {
+        /* Ring payload plane: the header stays a small TCP rendezvous and the
+         * payload moves as one all-gather over the USB4 links. */
+        if (!tp_tcp_exchange(tp, &h, &ph, NULL, NULL, 0)) return 0;
+    } else {
+        /* TCP keeps the production one-call header+payload exchange. */
+        if (!tp_tcp_exchange(tp, &h, &ph, out, in, tp->vec_bytes)) return 0;
+    }
     if (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate || ph.seq != seq) {
         fprintf(stderr, "ds4-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
                 layer, gate, (unsigned long long)seq);
         return 0;
     }
+    if (tp->ring) {
+        const double t_pay = tp->xchg_stats ? tp_now_sec() : 0.0;
+        if (!tp_ring_exchange(tp, out, in, tp->vec_bytes, NULL, 0)) {
+            fprintf(stderr, "ds4-tp: gate payload exchange failed (layer %u gate %u)\n",
+                    layer, gate);
+            return 0;
+        }
+        if (tp->xchg_stats) tp_xchg_note(tp, tp_now_sec() - t_pay, tp->vec_bytes);
+    }
+    if (tp->xchg_stats) tp_gate_note(tp, tp_now_sec() - t_whole, tp->vec_bytes);
     return 1;
 }
 
@@ -2801,6 +3052,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     if (!tp || ds4_tp_failed(tp)) return 0;
     if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS ||
         layer >= tp->n_layer * DS4_TP_BATCH_GATES_PER_LAYER) return 0;
+    const double t_whole = tp->xchg_stats ? tp_now_sec() : 0.0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
                              (uint16_t)rows, seq };
@@ -2829,9 +3081,13 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     }
 #endif
     ds4_tp_gate_header ph;
-    if (!tp_tcp_exchange(tp, &h, &ph,
-            tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
-            tp->slab + ds4_tp_slab_batch_in_offset(tp, layer), bytes)) return 0;
+    void *out = tp->slab + ds4_tp_slab_batch_out_offset(tp, layer);
+    void *in = tp->slab + ds4_tp_slab_batch_in_offset(tp, layer);
+    if (tp->ring) {
+        if (!tp_tcp_exchange(tp, &h, &ph, NULL, NULL, 0)) return 0;
+    } else {
+        if (!tp_tcp_exchange(tp, &h, &ph, out, in, (size_t)bytes)) return 0;
+    }
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != rows || ph.seq != seq) {
         fprintf(stderr,
@@ -2841,6 +3097,16 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                 layer, rows, (unsigned long long)seq);
         return 0;
     }
+    if (tp->ring) {
+        const double t_pay = tp->xchg_stats ? tp_now_sec() : 0.0;
+        if (!tp_ring_exchange(tp, out, in, (size_t)bytes, NULL, 0)) {
+            fprintf(stderr, "ds4-tp: batch gate payload exchange failed (layer %u rows %u)\n",
+                    layer, rows);
+            return 0;
+        }
+        if (tp->xchg_stats) tp_xchg_note(tp, tp_now_sec() - t_pay, (size_t)bytes);
+    }
+    if (tp->xchg_stats) tp_gate_note(tp, tp_now_sec() - t_whole, (size_t)bytes);
     return 1;
 }
 
@@ -2916,7 +3182,7 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
         return ok;
     }
 #endif
-    if (!tp_tcp_exchange(tp, NULL, NULL, out, in, bytes)) {
+    if (!tp_payload_exchange(tp, out, in, (size_t)bytes, NULL, 0)) {
         fprintf(stderr, "ds4-tp: big gate payload exchange failed (layer %u): %s\n",
                 layer, strerror(errno));
         return 0;

@@ -41797,6 +41797,12 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
     /* the producers write their partial into the slot unless the slab write is off */
     if ((ds41_tp_slab_off() && !ds4_gpu_tensor_copy(g->tp_out[slot], 0, x, 0, (uint64_t)DS4_N_EMBD * 4u)) ||
         !ds4_gpu_tp_gate_encode(il, gate)) return false;
+    if (g->tp_world > 2) {
+        /* The N-rank ring all-reduce hands back total - own in the `in` slot
+         * (ds4_tp.c tp_ring_exchange), so own + in is the full sum exactly
+         * once. The two-rank in/out pick below would add own twice. */
+        return ds4_gpu_add_tensor(x, x, g->tp_in[slot], DS4_N_EMBD) != 0;
+    }
     ds4_gpu_tensor *first = g->tp_rank ? g->tp_in[slot] : g->tp_out[slot];
     ds4_gpu_tensor *second = g->tp_rank ? g->tp_out[slot] : g->tp_in[slot];
     return ds4_gpu_add_tensor(x, first, second, DS4_N_EMBD) != 0;
@@ -42092,7 +42098,12 @@ static bool ds41_attention_expand(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_dsv41_matmul_expand_rows(g->after_attn, m->map, m->size, l->attn_output_b->abs_offset,
             l->attn_output_b->dim[0], l->attn_output_b->dim[1], g->low, NULL, g->residual,
             g->attn_split, DS4_N_HC, 1u)) return true;
+    /* Each rank projected only its DS4_N_OUT_GROUP/world group slice of the
+     * output B matrix, so g->block holds a partial sum. Sum the partials
+     * across the ring before the HC expand (world==1 needs nothing, and
+     * world==2 reduced in ds41_attention before reaching here). */
     return ds41_attention_b(g, m, l, g->block) &&
+        (g->tp_world < 2 || ds41_sum_partial(g, g->block, (uint32_t)rope_il, DS4_TP_GATE_ATTN)) &&
         ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split);
 }
 
@@ -74129,9 +74140,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  (!gpu_cfg || gpu_cfg->n_gpus <= 1)) ||
 #endif
                  false) &&
-#ifdef DS4_ROCM_BUILD
-            opt->tp.role == DS4_TP_NONE &&
-#endif
+            /* V4.1 network TP runs on ROCm too: the owned routed-MoE entry
+             * point and the Q8_0 K-slice projection that the group-sliced
+             * attention output needs are implemented in the ROCm backend
+             * (rocm/ds4_rocm_moe_launch.cuh, rocm/ds4_rocm_matmul.cuh). */
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
             !load_slice && !opt->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&

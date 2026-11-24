@@ -2948,3 +2948,76 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
                              force_resident, 0);
 }
+
+/* V4.1 (ds41_*) routed MoE over network TP.  The V4 Flash path already lets
+ * routed_moe_launch derive this rank's contiguous expert window from the bound
+ * world/rank (g_network_tp_world/rank, set by ds4_gpu_tp_init) and filter the
+ * router selection into scratch before rebasing the three expert-table offsets.
+ * The V4.1 graph instead calls this explicit entry point with the window it
+ * computed itself (ds41_tp_expert_range), so validate that both agree and hand
+ * the raw selection to the same launcher: owned_filtered stays 0, which is what
+ * turns the filter + rebase on. */
+extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        ds4_gpu_tensor *selected,
+        ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t resident_expert_base,
+        uint32_t resident_expert_count,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t layer_index,
+        uint32_t n_tokens,
+        bool *mid_is_f16) {
+    if (mid_is_f16) *mid_is_f16 = false;
+    if (g_network_tp_rank < 0 || g_network_tp_sharding_suspended) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "owned routed MoE needs a bound network TP rank (layer=%u)\n",
+                layer_index);
+        return 0;
+    }
+    /* Same contiguous window the launcher will derive; refuse a mismatch
+     * rather than silently reading a peer's experts. */
+    const uint32_t world = g_network_tp_world > 0 ? (uint32_t)g_network_tp_world : 1u;
+    const uint32_t rank = (uint32_t)g_network_tp_rank;
+    const uint32_t base = n_total_expert / world;
+    const uint32_t rem = n_total_expert % world;
+    const uint32_t first = rank * base + (rank < rem ? rank : rem);
+    const uint32_t count = base + (rank < rem ? 1u : 0u);
+    if (!n_total_expert || !n_expert || !n_tokens || !resident_expert_count ||
+        first != resident_expert_base || count != resident_expert_count ||
+        !gate_expert_bytes || !down_expert_bytes) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "owned routed MoE window mismatch (layer=%u total=%u base=%u/%u count=%u/%u)\n",
+                layer_index, n_total_expert, resident_expert_base, first,
+                resident_expert_count, count);
+        return 0;
+    }
+    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                             gate_offset, up_offset, down_offset,
+                             gate_type, down_type,
+                             gate_expert_bytes, gate_row_bytes,
+                             down_expert_bytes, down_row_bytes,
+                             expert_in_dim, expert_mid_dim, out_dim,
+                             selected, weights, n_total_expert, n_expert, clamp, x,
+                             layer_index, n_tokens, 0, 0);
+}

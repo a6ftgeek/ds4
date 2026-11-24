@@ -75,7 +75,10 @@ Use Q2 with SSD streaming on a 128 GB machine:
 The 341 GiB GGUF includes disk-only Engram tables. Keep it on a fast local
 SSD and start with automatic cache sizing. The matching
 [V4.1 DSpark](SPECULATIVE_DECODING.md#deepseek-v41-flash-dspark) support file
-is optional. V4.1 vision and network TP are not supported on ROCm.
+is optional. V4.1 vision is not supported on ROCm. V4.1 network TP runs on ROCm
+(4-node USB4 RDMA ring, `--tensor-parallel --tp-world-size N`): the
+ROCm backend implements the owned routed-MoE entry point and the Q8_0
+K-slice projection the group-sliced attention output needs.
 Large prefills are not yet tuned on this backend and can be slow.
 
 ## GLM 5.3 Flash

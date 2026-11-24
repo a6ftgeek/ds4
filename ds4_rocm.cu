@@ -247,7 +247,10 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     /* Do not leave the graph running ahead of a remote process. */
     const int ok = cuda_ok(cudaDeviceSynchronize(), "TP row arrival") &&
         g_rocm_tp.row(g_rocm_tp.ud, layer, gate, ++g_rocm_tp.row_seq);
-    if (!ok) g_rocm_tp.failed = true;
+    if (!ok) {
+        g_rocm_tp.failed = true;
+        fprintf(stderr, "ds4: ROCm TP row gate failed at layer %u gate %u\n", layer, gate);
+    }
     return ok;
 }
 
@@ -314,17 +317,6 @@ extern "C" void ds4_gpu_model_residency_skip(int skip) {
     (void)skip;
 }
 
-extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
-        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
-        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
-        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
-        uint64_t x_elem_off) {
-    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
-    (void)full_in_dim; (void)k_off; (void)k_cnt; (void)out_dim; (void)x;
-    (void)x_elem_off;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
-}
 
 extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map,

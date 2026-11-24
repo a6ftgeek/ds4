@@ -2693,6 +2693,15 @@ static int tp_ring_start(ds4_tp *tp, char *err, size_t errlen) {
     ro.cpu_core = tp->opt.ring_cpu_core;
     ro.verbose = getenv("DS4_TP_RING_VERBOSE") != NULL;
 
+    /* The ring may sit idle for seconds between tp_create() and the first
+     * prefill gate (session setup, kernel warm-up). The library's 1.05 ms
+     * default ACK timeout cannot absorb that cold wake-up: measured, the first
+     * 7.9 MB gate flushed its write with retry exhaustion. 67 ms (14) covers
+     * it, and once the busy-poll thread is pinned the warm path never pays the
+     * longer retransmit. Only set it when the caller has not chosen a value, so
+     * an A/B via the environment still works. */
+    setenv("USB4_RING_QP_TIMEOUT", "14", 0);
+
     if (ds4_tp_ring_create(&tp->ring, &ro, err, errlen) != 0) return 0;
     const ds4_tp_ring_backend backend = ds4_tp_ring_get_backend(tp->ring);
     if (backend != DS4_TP_RING_BACKEND_USB4) {

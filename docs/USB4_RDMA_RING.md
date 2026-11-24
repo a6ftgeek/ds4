@@ -233,31 +233,34 @@ DS4 TP=2, `ctx 2048`, greedy, 16 tokens, `--tp-cpu-core 8`:
 
 | | TP=1 | TP=2 TCP | TP=2 USB4 RDMA |
 |---|---|---|---|
-| prefill t/s | 92.12 | 88.59 | 89.31 |
-| decode t/s | 16.93 | 10.17 | 10.21 |
-| ms/token | 59.1 | 98.3 | 97.9 |
-| whole gate exchange | — | 129.8 us | 104.7 us |
+| prefill t/s | 89.62 | 88.59 | 93.84 |
+| decode t/s | 16.92 | 10.17 | 10.23 |
+| ms/token | 59.1 | 98.3 | 97.8 |
+| whole gate exchange | — | 129.8 us | 104.3 us |
 | resident model/rank | 80.76 GiB | 44.48 GiB | 44.48 GiB |
 | GTT peak/rank | 87.88 GiB | 55.97 GiB | 55.97 GiB |
 
-The ring all-gather itself is 60.5 us per decode gate; the rest of the 104.7 us
+The ring all-gather itself is 60.1 us per decode gate; the rest of the 104.3 us
 is the TCP header rendezvous. TCP has no separately measured payload because
 production sends header and payload in one call; a variant that split them
 measured 107 us of payload and a 150.7 us whole exchange, i.e. the split costs
 about 20 us, which is why the production API was left coalesced.
 
 The greedy 16-token text is byte-identical across all three configurations.
+Prefill varies by a few percent between runs (clocks); decode is stable.
 
-The ~900 us/layer implied by the 10.17 t/s vs 16.93 t/s delta is **not** the
-exchange: the measured whole gate exchange is 130 us/layer over TCP and 105
+The ~900 us/layer implied by the 10.17 t/s vs 16.92 t/s delta is **not** the
+exchange: the measured whole gate exchange is 130 us/layer over TCP and 104
 us/layer over USB4, so ~780 us/layer sits outside the exchange (per-rank
 compute / MoE efficiency at the 50/50 expert split, not the link). USB4 RDMA
 removes ~25 us/layer, about 1 ms/token — real, but far too small to close the
-gap. Two practical requirements came out of this: the RDMA busy-poll thread
+gap. Three practical requirements came out of this: the RDMA busy-poll thread
 must be pinned (`--tp-cpu-core`), because otherwise scheduling gaps stretch the
-tail to ~10 ms and decode falls to 6.43 t/s; and 512 KiB is the largest chunk
-that fits the container's 8 MiB `RLIMIT_MEMLOCK` (4 MiB fails `ibv_reg_mr` with
-`ENOMEM`).
+tail to ~10 ms and decode falls to 6.43 t/s; 512 KiB is the largest chunk that
+fits the container's 8 MiB `RLIMIT_MEMLOCK` (4 MiB fails `ibv_reg_mr` with
+`ENOMEM`); and the engine raises `USB4_RING_QP_TIMEOUT` to 14 (67 ms) unless
+the caller set it, because the first prefill gate follows seconds of setup and
+the library's 1.05 ms default flushed the write with retry exhaustion.
 
 ## Two cluster-facing caveats
 

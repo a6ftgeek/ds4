@@ -69,6 +69,31 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
+# --- Opt-in USB4 RDMA ring transport ---------------------------------------
+# USE_USB4_RDMA=1 compiles the libibverbs-backed ring backend and links it.
+# Left unset -- the default -- the tree needs no RDMA headers or libraries, so
+# ordinary builds and TCP-only runs are unaffected. ds4_tp_ring.o itself is
+# always linked: it provides the TCP ring and stays inert until a multi-rank
+# run selects it.
+# The two modes use distinct object files so that switching USE_USB4_RDMA can
+# never link an object built with the other mode's flags.
+USE_USB4_RDMA ?= 0
+ifeq ($(USE_USB4_RDMA),1)
+DS4_RING_OBJS := ds4_tp_ring.usb4.o misc/usb4/usb4_rdma_ring.o
+DS4_RING_CFLAGS := -DUSE_USB4_RDMA=1 -Imisc/usb4
+DS4_RING_LDLIBS := -libverbs
+else
+DS4_RING_OBJS := ds4_tp_ring.o
+DS4_RING_CFLAGS :=
+DS4_RING_LDLIBS :=
+endif
+# override: the platform targets below pass CFLAGS/CORE_OBJS on the command
+# line, which would otherwise discard these appends.
+override CORE_OBJS += $(DS4_RING_OBJS)
+override CPU_CORE_OBJS += $(DS4_RING_OBJS)
+override DS4_LINK_LIBS += $(DS4_RING_LDLIBS)
+override LDLIBS += $(DS4_RING_LDLIBS)
+
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
@@ -876,6 +901,15 @@ ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
 ds4_tp.o: ds4_tp.c ds4_tp.h ds4.h ds4_ssd.h ds4_gpu.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_tp.c
 
+ds4_tp_ring.o: ds4_tp_ring.c ds4_tp_ring.h
+	$(CC) $(CFLAGS) $(DS4_RING_CFLAGS) -c -o $@ ds4_tp_ring.c
+
+ds4_tp_ring.usb4.o: ds4_tp_ring.c ds4_tp_ring.h
+	$(CC) $(CFLAGS) $(DS4_RING_CFLAGS) -c -o $@ ds4_tp_ring.c
+
+misc/usb4/usb4_rdma_ring.o: misc/usb4/usb4_rdma_ring.c misc/usb4/usb4_rdma_ring.h
+	$(CC) $(CFLAGS) $(DS4_RING_CFLAGS) -c -o $@ misc/usb4/usb4_rdma_ring.c
+
 ds4_help.o: ds4_help.c ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_help.c
 
@@ -1367,6 +1401,30 @@ tests/test_tp_tcp.o: tests/test_tp_tcp.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
 tests/test_tp_tcp: tests/test_tp_tcp.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_tp_ring.o: tests/test_tp_ring.c ds4_tp_ring.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_tp_ring: tests/test_tp_ring.o $(DS4_RING_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Ring collective seam: N-rank all-reduce/all-gather, no model weights needed.
+# The single-host form runs four ranks on loopback; use
+# `./tests/test_tp_ring <rank> <world> <ip,ip,...> <port>` for a real ring.
+.PHONY: test-tp-ring
+test-tp-ring: tests/test_tp_ring
+	@set -e; p=19730; rm -f /tmp/ds4-tp-ring-*.log; \
+	for r in 0 1 2 3; do \
+		./tests/test_tp_ring $$r 4 127.0.0.1,127.0.0.1,127.0.0.1,127.0.0.1 $$p \
+			> /tmp/ds4-tp-ring-$$r.log 2>&1 & \
+	done; \
+	wait || true; \
+	cat /tmp/ds4-tp-ring-0.log /tmp/ds4-tp-ring-1.log \
+	    /tmp/ds4-tp-ring-2.log /tmp/ds4-tp-ring-3.log; \
+	if grep -q FAIL /tmp/ds4-tp-ring-*.log; then exit 1; fi; \
+	if [ $$(grep -l PASS /tmp/ds4-tp-ring-*.log | wc -l) -ne 4 ]; then \
+		echo "test-tp-ring: not every rank passed" >&2; exit 1; \
+	fi
+
 .PHONY: test-session-state
 test-session-state: tests/test_session_state tests/test_tp_commands tests/test_tp_rdma tests/test_tp_tcp
 	./tests/test_session_state
@@ -1591,7 +1649,8 @@ clean:
 	rm -f tests/test_metal_device_policy
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_deepseek_indexer
-	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp tests/test_cuda_tp_link
+	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp tests/test_tp_ring tests/test_cuda_tp_link
+	rm -f misc/usb4/*.o ds4_tp_ring.usb4.o
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

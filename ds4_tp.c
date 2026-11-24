@@ -573,7 +573,13 @@ void ds4_tp_usage(FILE *fp) {
     fprintf(fp,
         "Tensor parallelism (two identical machines):\n"
         "  --tensor-parallel           Use --role/--listen/--coordinator for a 50/50 TP pair.\n"
-        "  --transport <auto|rdma|tcp> Gate transport (default auto).\n"
+        "  --transport <auto|rdma|tcp|usb4-rdma>\n"
+        "                              Gate transport (default auto). usb4-rdma\n"
+        "                              selects the N-rank switchless-ring path.\n"
+        "  --tp-world-size <n>         Ranks in the ring (default 2).\n"
+        "  --tp-ring-ip <addr>         Control address of one rank; repeat in\n"
+        "                              rank order (ring transports only).\n"
+        "  --tp-cpu-core <n>           Pin the ring thread to core n. Default off.\n"
         "  --rdma-device <name>        Select a verbs device such as rdma_en1.\n"
         "  --rdma-gid-index <n>        Select the local verbs GID index.\n"
         "  --tensor-parallel-token-prefill\n"
@@ -599,10 +605,43 @@ int ds4_tp_parse_cli_arg(
         if (!strcmp(v, "auto")) opt->transport = DS4_TP_TRANSPORT_AUTO;
         else if (!strcmp(v, "rdma")) opt->transport = DS4_TP_TRANSPORT_RDMA;
         else if (!strcmp(v, "tcp")) opt->transport = DS4_TP_TRANSPORT_TCP;
+        else if (!strcmp(v, "usb4-rdma")) opt->transport = DS4_TP_TRANSPORT_USB4_RDMA;
         else {
             tp_set_err(err, errlen, "invalid %s value: %s", arg, v);
             return DS4_TP_CLI_ERROR;
         }
+    } else if (!strcmp(arg, "--tp-world-size")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || errno != 0 ||
+            v < 2 || v > DS4_TP_MAX_RANKS) {
+            tp_set_err(err, errlen, "%s needs an integer in 2..%d",
+                       arg, DS4_TP_MAX_RANKS);
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->world_size = (int)v;
+    } else if (!strcmp(arg, "--tp-ring-ip")) {
+        if (i + 1 >= argc) goto missing;
+        int slot = 0;
+        while (slot < DS4_TP_MAX_RANKS && opt->ring_ip[slot]) slot++;
+        if (slot == DS4_TP_MAX_RANKS) {
+            tp_set_err(err, errlen, "%s accepts at most %d addresses",
+                       arg, DS4_TP_MAX_RANKS);
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->ring_ip[slot] = argv[++i];
+    } else if (!strcmp(arg, "--tp-cpu-core")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || errno != 0 || v < 0 || v > 4096) {
+            tp_set_err(err, errlen, "%s needs a core index", arg);
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->ring_cpu_core = (int)v;
     } else if (!strcmp(arg, "--rdma-device")) {
         if (i + 1 >= argc) goto missing;
         opt->rdma_device = argv[++i];
@@ -706,12 +745,35 @@ int ds4_tp_validate_engine_options(
     if (!ds4_tp_enabled(&opt->tp)) {
         if (opt->tp.requested || opt->tp.transport != DS4_TP_TRANSPORT_AUTO ||
             opt->tp.rdma_device || opt->tp.rdma_gid_index_set ||
-            opt->tp.glm_token_prefill || opt->tp.debug_hash != 0) {
+            opt->tp.glm_token_prefill || opt->tp.debug_hash != 0 ||
+            opt->tp.world_size > 2 || opt->tp.ring_cpu_core >= 0 ||
+            opt->tp.ring_ip[0] != NULL) {
             tp_set_err(err, errlen,
                        "tensor-parallel options require --tensor-parallel and --role");
             return 0;
         }
         return 1;
+    }
+    if (opt->tp.world_size > 2) {
+        /* The collective transport for N ranks is implemented and tested
+         * (tests/test_tp_ring), but the weight/graph split around it is not:
+         * ds4_cuda.cu's derived-artifact builder rejects world != 2, ds4.c's
+         * attention/FFN/shared-expert splits are gated on tp_world == 2, and
+         * the logits split is a fixed two-way halving. Refuse rather than run
+         * a wrong split. */
+        tp_set_err(err, errlen,
+                   "tp: --tp-world-size %d is not supported yet: the expert, "
+                   "attention and FFN sharding (ds4.c) plus the CUDA "
+                   "derived-artifact builder are still 2-rank; only the ring "
+                   "collective transport is generalized",
+                   opt->tp.world_size);
+        return 0;
+    }
+    if (opt->tp.transport == DS4_TP_TRANSPORT_USB4_RDMA) {
+        tp_set_err(err, errlen,
+                   "tp: --transport usb4-rdma needs --tp-world-size above 2; "
+                   "use --transport rdma for a 2-rank pair");
+        return 0;
     }
     bool supported_backend = opt->backend == DS4_BACKEND_METAL;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)

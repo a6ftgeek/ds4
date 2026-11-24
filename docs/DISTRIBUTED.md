@@ -143,6 +143,43 @@ Use `--batched-session 8` on the server and allow memory for all eight contexts.
 Flash 0731 network sessions currently run in order, without native batching.
 CUDA network TP does not support vision, V4.1 DSpark or other model/quant layouts.
 
+### N-rank ring collectives (work in progress)
+
+The collective transport needed for a four-node tensor-parallel ring exists and
+is tested, but the sharding around it does not yet generalise, so
+`--tp-world-size` above 2 is rejected at startup. Two facts are worth keeping
+straight:
+
+- The transport (`ds4_tp_ring.c`) is done. `--transport usb4-rdma` selects a
+  switchless-ring all-reduce whose only traffic is to the two physical
+  neighbours, using one-sided `IBV_WR_RDMA_WRITE` with a trailing 64-bit
+  sequence marker that the receiver busy-polls. No receive WQEs are posted, so
+  RNR-NACK stalls cannot happen. A TCP ring backend implements the same
+  contract for machines with no verbs device, and is the automatic fallback
+  when any rank lacks an IPv4-mapped GID.
+- The sharding is still two-rank. `ds4_cuda.cu`'s derived-artifact builder
+  rejects any world size other than 1 or 2, `ds4.c` gates its attention, FFN
+  and shared-expert splits on `tp_world == 2`, and the logits split is a fixed
+  two-way halving. `--tp-world-size 4` therefore reports what is missing
+  instead of running a wrong split.
+
+The transport takes an arbitrary element count and dtype, needs no particular
+buffer alignment, and never converts what it is handed, so prefill batches,
+variable-length speculative verification and vision embeddings can all use it
+unchanged.
+
+To exercise it without weights:
+
+```sh
+make test-tp-ring                                  # four ranks on loopback
+./tests/test_tp_ring <rank> 4 <ip0,ip1,ip2,ip3> <port>   # across real nodes
+```
+
+Build with `USE_USB4_RDMA=1` to compile the verbs backend; the default build
+needs no RDMA headers or libraries and links nothing extra. Pass
+`--tp-cpu-core N` to pin the ring thread while benchmarking, and set
+`--tp-ring-ip` once per rank in rank order to supply the control addresses.
+
 ## Pipeline parallelism
 
 Each process maps only its assigned layers, retaining that slice of the KV

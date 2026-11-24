@@ -107,10 +107,17 @@ typedef enum {
     DS4_TP_WORKER,
 } ds4_tp_role;
 
+/* Largest ring this build can describe; the transport itself accepts
+ * DS4_TP_RING_MAX_WORLD. */
+#define DS4_TP_MAX_RANKS 8
+
 typedef enum {
     DS4_TP_TRANSPORT_AUTO = 0,
     DS4_TP_TRANSPORT_RDMA,
     DS4_TP_TRANSPORT_TCP,
+    /* N-rank switchless-ring transport (ds4_tp_ring.c). Distinct from RDMA,
+     * which is the 2-rank pairwise verbs path above. */
+    DS4_TP_TRANSPORT_USB4_RDMA,
 } ds4_tp_transport;
 
 typedef struct {
@@ -124,6 +131,12 @@ typedef struct {
     const char *rdma_device;
     int rdma_gid_index;
     bool rdma_gid_index_set;
+    /* Ring transport. world_size 2 (the default) keeps the existing pairwise
+     * exchange; larger values use ds4_tp_ring.c. ring_ip holds one control
+     * address per rank, in rank order, and is only read when world_size > 2. */
+    int world_size;
+    int ring_cpu_core;          /* < 0 leaves scheduling to the kernel */
+    const char *ring_ip[DS4_TP_MAX_RANKS];
     bool glm_token_prefill;
     int debug_hash;             /* cross-check hidden state every N tokens */
 } ds4_tp_options;

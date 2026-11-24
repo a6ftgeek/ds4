@@ -1,5 +1,11 @@
 # USB4/Thunderbolt RDMA ring collectives for DS4 tensor parallelism
 
+> **Status 2026-11-24 (`feat/rocm-tp-ring` @ `79a9247`):** N-rank sharding
+> landed and world=4 now runs end to end over the USB4 ring. The "2-rank
+> only" and "NOT MEASURED" sections below are historical; see
+> [World=4 verified end to end](#world4-verified-end-to-end-2026-11-24).
+
+
 ## Problem
 
 DS4's tensor parallelism is two ranks, `leader` + one `worker`, and every
@@ -269,3 +275,64 @@ the library's 1.05 ms default flushed the write with retry exhaustion.
 * The vendored module differs from upstream in exactly two places: the
   `#ifndef _GNU_SOURCE` guard and the QP ACK timeout default. Both are
   documented at their call sites and should be upstreamed.
+
+## World=4 verified end to end (2026-11-24)
+
+Four nodes, one 81 GiB Q2 checkpoint per host
+(`DeepSeek-V4-Flash-...-0731.gguf`), greedy, `--temp 0 -n 16`, rank 0 on node1
+and ranks 1-3 on node2-4, `--transport usb4-rdma --tp-world-size 4
+--tp-cpu-core 2`. Launch script: `dsbench/usb4-rdma/launch_tp4_best.sh`.
+
+| config | resident/rank | GTT peak/rank | prefill t/s | decode t/s |
+|---|---:|---:|---:|---:|
+| TP=4 USB4, ctx 2048 | 26.34 GiB | 37.82 GiB | 64.25 | 9.65 |
+| TP=4 USB4, ctx 1048576 | 26.34 GiB | 47.88 GiB | 234.42 (30k-token prompt) | 8.43 |
+
+The ctx-2048 text is md5 `a13ba035b8347fa92e602fd8f751ca91`, byte-identical to
+the TP=1 reference for the same prompt. Prefill varies by a few percent between
+runs (clocks and prompt length); decode is stable. The 43-layer expert-owning
+split holds resident model/rank at 26.34 GiB, the same as the TP=2 USB4 split.
+
+### 1M context with compressed KV
+
+`-c 1048576` is the checkpoint's trained context and the largest value tested.
+The graph backend allocates:
+
+```
+memory: KV 13.79 GiB (raw 0.36 + compressed 13.44) + buffers 8.00 GiB
+        + resident model 26.34 GiB = 48.13 GiB planned
+memory detail: ctx=1048576 prefill_cap=4096 raw_kv_rows=4352
+               compressed_kv_rows=262146 backend=rocm
+```
+
+Every rank printed the same plan. GTT peak was 47.88 GiB/rank and node1
+`MemAvailable` never fell below 42.85 GiB, so 1M is reachable with wide headroom
+on a 124 GiB UMA host. A 30,474-token story prompt, with "was assigned the
+number ..." facts deep in the text and the output task at the end, produced
+
+```
+Bob=34
+Alice=52
+Clara=71
+```
+
+which are the exact written-out assignments in the prompt (Bob=34 is also the
+given example), and prefill ran at 234.42 t/s in 4096-token chunks. Filling the
+full 1M tokens was not attempted: at the measured chunk rate it is a multi-hour
+prefill, and context capacity is already proven by the allocation above.
+
+### Features not enabled at world=4
+
+* **Vision** stays off. The downloadable `ds41f-vision` file is the V4.1
+  sidecar; the 0731 checkpoint is rejected at `ds4.c:74106`, V4.1 vision is
+  Metal-only at `ds4.c:74034`, and the 0731 weights contain no vision
+  projection (the Vision-Exp checkpoint is a different download). All four
+  ranks exit with:
+  `ds4: --vision requires GLM-5.3, Qwen3.8-Flash-Next or the pinned DeepSeek V4
+  Flash Vision-Exp or V4.1 Flash model`.
+* **DSpark / MTP** stays off. The matching 0731 drafter runs on ROCm
+  single-host, but the mirrored speculative-verify worker path is rank-1-only
+  (`ds4.c:85410`) and the lockstep drafter split is compiled out on ROCm
+  (`ds4.c:75261`, `ds4.c:80511`). At world=4, ranks 2 and 3 abort with
+  `tp: spec cycle outside worker mode` at the first spec cycle. Details and the
+  single-host measurement are in `dsbench/usb4-rdma/FEATURE_STATUS.md`.

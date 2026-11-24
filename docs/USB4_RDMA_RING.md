@@ -237,9 +237,14 @@ DS4 TP=2, `ctx 2048`, greedy, 16 tokens, `--tp-cpu-core 8`:
 | decode t/s | 16.93 | 10.17 | 10.21 |
 | ms/token | 59.1 | 98.3 | 97.9 |
 | whole gate exchange | — | 129.8 us | 104.7 us |
-| payload per gate | — | ~110 us | 60.5 us |
 | resident model/rank | 80.76 GiB | 44.48 GiB | 44.48 GiB |
 | GTT peak/rank | 87.88 GiB | 55.97 GiB | 55.97 GiB |
+
+The ring all-gather itself is 60.5 us per decode gate; the rest of the 104.7 us
+is the TCP header rendezvous. TCP has no separately measured payload because
+production sends header and payload in one call; a variant that split them
+measured 107 us of payload and a 150.7 us whole exchange, i.e. the split costs
+about 20 us, which is why the production API was left coalesced.
 
 The greedy 16-token text is byte-identical across all three configurations.
 

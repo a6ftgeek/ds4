@@ -83,13 +83,17 @@ struct ds4_gpu_tensor {
     int owner;
 };
 
-/* Network tensor parallelism: a bound rank owns one contiguous half of every
+/* Network tensor parallelism: a bound rank owns one contiguous slice of every
  * layer's routed experts (weights_model_map_sharded_spans in ds4.c maps exactly
  * that range).  The routed-MoE launcher filters the router selection to the
  * owned range and rebases the three expert-table offsets onto it, so a
  * non-owned expert's bytes are never read.  This mirrors ds4_cuda.cu's
- * g_network_tp_rank gate; rank -1 means "no network TP bound". */
+ * g_network_tp_rank gate; rank -1 means "no network TP bound".  World is the
+ * number of ranks in the collective: the owned slice is n_expert/world wide
+ * with the remainder handed to the lowest ranks, so world=2 keeps the historical
+ * 50/50 split. */
 int g_network_tp_rank = -1;
+int g_network_tp_world = 1;
 bool g_network_tp_sharding_suspended = false;
 static int32_t *g_network_tp_pairs_ids;
 static float *g_network_tp_pairs_weights;
@@ -208,10 +212,15 @@ static struct {
     bool failed;
 } g_rocm_tp;
 
+extern "C" void ds4_gpu_tp_set_world(uint32_t world) {
+    g_network_tp_world = world > 0 ? (int)world : 1;
+}
+
 extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
         uint64_t gpu_flags_off, uint64_t out_off, uint64_t vec_bytes,
         ds4_gpu_tp_exchange_fn fn, void *ud) {
-    if (g_rocm_tp.row || rank > 1 || !slab || !fn || !vec_bytes ||
+    if (g_rocm_tp.row || !slab || !fn || !vec_bytes ||
+        rank >= (uint32_t)g_network_tp_world ||
         out_off > slab->bytes || vec_bytes > slab->bytes - out_off ||
         gpu_flags_off >= slab->bytes) return 0;
     g_rocm_tp.row = fn;
@@ -224,6 +233,7 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
 extern "C" void ds4_gpu_tp_shutdown(void) {
     if (g_rocm_tp.row) (void)cudaDeviceSynchronize();
     g_network_tp_rank = -1;
+    g_network_tp_world = 1;
     g_network_tp_sharding_suspended = false;
     ds4_rocm_tp_pairs_release();
     if (g_rocm_tp.staging) (void)cudaFreeHost(g_rocm_tp.staging);

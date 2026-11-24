@@ -934,26 +934,39 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
 extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map,
         uint64_t model_size, uint64_t a, uint64_t b,
-        const ds4_gpu_tensor *heads, uint32_t rows, uint32_t rank) {
-    const uint64_t shard_bytes = UINT64_C(4) * 1024 * (4096 / 32 * 34);
-    if (rank > 1 || !rows || a > model_size || 2u * shard_bytes > model_size - a ||
+        const ds4_gpu_tensor *heads, uint32_t rows, uint32_t rank,
+        uint32_t world) {
+    /* The attention output projection is sharded over the DS4_N_OUT_GROUP=8
+     * lane groups of the low-rank A matrix and, correspondingly, over the
+     * 8192-wide intermediate of the B matrix. Each rank owns 8/world of the
+     * lane groups, 8192/world B columns, and the matching 32768/world heads of
+     * the input; the caller's gate sums the rank partials. world=2 is the
+     * historical 4-group / 16384-head-half split and any divisor of 8 works. */
+    if (world < 2 || rank >= world || (8u % world) != 0) return 0;
+    const uint32_t groups = 8u / world;
+    const uint32_t shard_dim = groups * 1024u;          /* 8192/world B columns */
+    const uint32_t heads_dim = groups * 4096u;          /* 32768/world input row */
+    const uint64_t shard_bytes = (uint64_t)shard_dim * (4096 / 32 * 34);
+    if (!rows || a > model_size ||
+        (uint64_t)world * shard_bytes > model_size - a ||
         !dsv41_has_floats(out, (uint64_t)rows * 5120u) ||
-        !dsv41_has_floats(low, (uint64_t)rows * 4096u) ||
-        !dsv41_has_floats(heads, (uint64_t)rows * 16384u)) return 0;
+        !dsv41_has_floats(low, (uint64_t)rows * shard_dim) ||
+        !dsv41_has_floats(heads, (uint64_t)rows * heads_dim)) return 0;
+    const uint64_t a_offset = a + (uint64_t)rank * shard_bytes;
     for (uint32_t first = 0; first < rows;) {
         const uint32_t count = min(rows - first, 65535u / 4u);
         ds4_gpu_tensor x = *heads, y = *low;
-        x.ptr = (float *)x.ptr + (uint64_t)first * 16384u;
-        x.bytes = (uint64_t)count * 16384u * sizeof(float);
-        y.ptr = (float *)y.ptr + (uint64_t)first * 4096u;
-        y.bytes = (uint64_t)count * 4096u * sizeof(float);
+        x.ptr = (float *)x.ptr + (uint64_t)first * heads_dim;
+        x.bytes = (uint64_t)count * heads_dim * sizeof(float);
+        y.ptr = (float *)y.ptr + (uint64_t)first * shard_dim;
+        y.bytes = (uint64_t)count * shard_dim * sizeof(float);
         if (!ds4_gpu_attention_output_low_q8_rows_exact_tensor(&y, model_map, model_size,
-                a + rank * shard_bytes, 4096u, 1024u, 4u, 0u, 4u, &x, count)) return 0;
+                a_offset, 4096u, 1024u, groups, 0u, groups, &x, count)) return 0;
         first += count;
     }
-    return ds4_gpu_dsv41_quantize(low, 4096u, rows, DS4_V41_BF16) &&
+    return ds4_gpu_dsv41_quantize(low, shard_dim, rows, DS4_V41_BF16) &&
         ds4_gpu_matmul_q8_0_kslice_rows_tensor(out, model_map, model_size,
-            b, 8192u, 5120u, rank * 4096u, 4096u, low, rows);
+            b, 8192u, 5120u, (uint64_t)rank * shard_dim, shard_dim, low, rows);
 }
 
 /* Metal folds these bf16 roundings into the producing kernels; here the

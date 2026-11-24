@@ -73,6 +73,9 @@ typedef struct {
     const char *right_dev;
     const char *left_dev;
     int gid_index;              /* < 0 auto-selects the IPv4-mapped GID */
+    /* Skip the USB4 backend on every rank (the A/B control for the transport
+     * comparison); the collective then runs over the management network. */
+    bool force_tcp;
     size_t chunk_bytes;         /* per-rank segment size; 0 -> library default */
     int connect_timeout_ms;     /* 0 -> library default */
     /* Optional busy-spin CPU pinning. < 0 (the default) leaves scheduling to

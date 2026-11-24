@@ -135,6 +135,9 @@ typedef struct {
      * exchange; larger values use ds4_tp_ring.c. ring_ip holds one control
      * address per rank, in rank order, and is only read when world_size > 2. */
     int world_size;
+    /* This worker's rank in the ring, 1..world-1. The coordinator is always
+     * rank 0 and ignores it. Default -1 -> 1 keeps the 2-rank CLI unchanged. */
+    int rank_index;
     int ring_cpu_core;          /* < 0 leaves scheduling to the kernel */
     const char *ring_ip[DS4_TP_MAX_RANKS];
     bool glm_token_prefill;

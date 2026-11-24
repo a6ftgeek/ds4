@@ -103,6 +103,8 @@ int ds4_tp_create(
 void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
+/* Ranks in the collective (2 unless --tp-world-size says otherwise). */
+int ds4_tp_world(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
 /* True when the bulk gate payloads move over the USB4 RDMA ring
  * (--transport usb4-rdma). Control frames and gate headers still use TCP, so

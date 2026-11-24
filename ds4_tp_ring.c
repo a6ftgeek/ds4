@@ -624,7 +624,7 @@ int ds4_tp_ring_create(ds4_tp_ring **out, const ds4_tp_ring_options *opt,
         free(r);
         return -1;
     }
-    const unsigned char mine = ring_probe_usb4(&r->opt) ? 1u : 0u;
+    const unsigned char mine = (!r->opt.force_tcp && ring_probe_usb4(&r->opt)) ? 1u : 0u;
     flags[r->rank] = mine;
     if (r->world > 1 &&
         ring_tcp_exchange_flags(r, mine, flags, err, errlen) != 0) {
@@ -705,6 +705,9 @@ int ds4_tp_ring_create(ds4_tp_ring **out, const ds4_tp_ring_options *opt,
 #endif
     if (r->backend != DS4_TP_RING_BACKEND_USB4) {
         fprintf(stderr,
+                r->opt.force_tcp ?
+                "ds4-tp: ring forced onto the TCP backend by the caller "
+                "(force_tcp)\n" :
                 "ds4-tp: no usable USB4 RDMA device or IPv4-mapped GID on every "
                 "rank; using the TCP ring\n");
     }

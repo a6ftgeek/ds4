@@ -112,6 +112,11 @@ typedef struct {
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
     uint32_t rdma_max_msg; /* formerly zero padding: zero offers legacy 16 KiB */
+    /* This rank's index and the agreed world size. The leader uses the index
+     * to bind an accepted socket to its rank; both sides reject a different
+     * world size before any slab or sharding decision is made. */
+    uint32_t rank;
+    uint32_t world;
     uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_hello_fixed;
 
@@ -249,7 +254,16 @@ typedef struct {
 
 struct ds4_tp {
     ds4_tp_options opt;
-    int rank;                   /* 0 leader, 1 worker */
+    int rank;                   /* 0 leader, 1..world-1 workers */
+    /* N-rank control plane: rank 0 holds one socket pair per worker (peer
+     * r-1 is rank r); a worker holds exactly one pair, to the leader. The
+     * legacy control_fd/data_fd names stay as the first peer's sockets, so
+     * the pairwise call sites and the RDMA bring-up need no changes. */
+    int world;
+    int n_peer;
+    int peer_ctl[DS4_TP_MAX_RANKS];
+    int peer_data[DS4_TP_MAX_RANKS];
+    int peer_rank[DS4_TP_MAX_RANKS];
     int control_fd;
     int data_fd;                /* TCP fallback, headers, and verify gates */
     bool rdma_active;
@@ -499,9 +513,15 @@ static int tp_tcp_exchange_io(ds4_tp *tp, ds4_tp_gate_header *header,
     return 1;
 }
 
+static int tp_tcp_exchange_multi(ds4_tp *tp, ds4_tp_gate_header *header,
+                                 ds4_tp_gate_header *peer_header,
+                                 const void *out, void *in, size_t bytes);
+
 static int tp_tcp_exchange(ds4_tp *tp, ds4_tp_gate_header *header,
                            ds4_tp_gate_header *peer_header,
                            const void *out, void *in, size_t bytes) {
+    if (tp->n_peer > 1)
+        return tp_tcp_exchange_multi(tp, header, peer_header, out, in, bytes);
 #ifdef __APPLE__
     /* Darwin sendmsg can block despite MSG_DONTWAIT. The data socket has
      * one exchange owner; restore its mode before blocking header I/O. */
@@ -521,10 +541,18 @@ static int tp_tcp_exchange(ds4_tp *tp, ds4_tp_gate_header *header,
 
 /* ------------------------------------------------------- USB4 ring payload */
 
-/* Move one bulk gate payload over the USB4 RDMA ring: each rank contributes
- * `bytes` and receives the peer's contribution. ds4_tp_ring_all_gather gives
- * [rank0 | rank1], so the peer's copy is the other half. Only used at world=2,
- * where both neighbours are the same peer. */
+/* Move one bulk gate payload over the USB4 RDMA ring.
+ *
+ * At world=2 each rank contributes `bytes` and receives the other rank's
+ * contribution: ds4_tp_ring_all_gather gives [rank0 | rank1], so the peer's
+ * copy is the other half, and the consumer adds its own partial to it exactly
+ * as the TCP pairwise path does (bit-identical, no host arithmetic).
+ *
+ * At world>2 every layer has to reduce across all N ranks. The payload is a
+ * float32 partial sum, so the ring all-reduces it in place (dtype F32, SUM) and
+ * the caller is handed total - own, i.e. the sum of the OTHER ranks'
+ * contributions. That keeps every consumer's `own + exchange` shape unchanged
+ * and cannot double count this rank. */
 static int tp_ring_exchange(ds4_tp *tp, const void *out, void *in, size_t bytes,
                             char *err, size_t errlen) {
     if (!tp->ring || bytes == 0) {
@@ -534,6 +562,35 @@ static int tp_ring_exchange(ds4_tp *tp, const void *out, void *in, size_t bytes,
     if (bytes > SIZE_MAX / 2u) {
         tp_set_err(err, errlen, "ring payload exchange: %zu bytes is too large", bytes);
         return 0;
+    }
+    if (tp->world > 2) {
+        if (bytes % sizeof(float) != 0 || !in) {
+            tp_set_err(err, errlen,
+                       "ring payload exchange: %zu bytes is not a float32 partial",
+                       bytes);
+            return 0;
+        }
+        if (tp->ring_stage_bytes < bytes) {
+            void *p = realloc(tp->ring_stage, bytes);
+            if (!p) {
+                tp_set_err(err, errlen,
+                           "ring payload staging allocation (%zu bytes) failed", bytes);
+                return 0;
+            }
+            tp->ring_stage = p;
+            tp->ring_stage_bytes = bytes;
+        }
+        memcpy(tp->ring_stage, out, bytes);
+        if (ds4_tp_ring_all_reduce(tp->ring, tp->ring_stage, bytes / sizeof(float),
+                                   DS4_TP_RING_DTYPE_F32, DS4_TP_RING_OP_SUM,
+                                   err, errlen) != 0)
+            return 0;
+        const float *sum = (const float *)tp->ring_stage;
+        const float *own = (const float *)out;
+        float *dst = (float *)in;
+        const size_t elems = bytes / sizeof(float);
+        for (size_t i = 0; i < elems; i++) dst[i] = sum[i] - own[i];
+        return 1;
     }
     const size_t need = bytes * 2u;
     if (tp->ring_stage_bytes < need) {
@@ -604,7 +661,8 @@ static int tp_listen(const char *host, int port, char *err, size_t errlen) {
         if (fd < 0) continue;
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 2) == 0) break;
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 &&
+            listen(fd, DS4_TP_MAX_RANKS) == 0) break;
         close(fd);
         fd = -1;
     }
@@ -668,6 +726,13 @@ static int tp_mbox_get(ds4_tp *tp, uint32_t *type, uint8_t **payload, uint32_t *
  * RDMA mailbox a frame that fits travels in the ring; a larger one sends a
  * ring marker and then the frame on the TCP control channel, so the worker
  * still takes commands strictly in order. */
+static int tp_peer_send_frame(ds4_tp *tp, int data, uint32_t type,
+                              const void *payload, uint32_t bytes);
+static int tp_peer_recv_frame(ds4_tp *tp, int data, uint32_t *type,
+                              unsigned char **payload, uint32_t *bytes);
+static int tp_peer_write(ds4_tp *tp, int data, const void *buf, size_t bytes);
+static int tp_peer_read(ds4_tp *tp, int data, void *buf, size_t bytes);
+
 static int tp_send_command(ds4_tp *tp, uint32_t type, const void *payload, uint32_t bytes) {
     if (!tp || ds4_tp_failed(tp)) return 0;
     int ok;
@@ -677,10 +742,10 @@ static int tp_send_command(ds4_tp *tp, uint32_t type, const void *payload, uint3
             ok = tp_mbox_put(tp, type, payload, bytes);
         else
             ok = tp_mbox_put(tp, DS4_TP_MBOX_FRAME_TCP, NULL, 0) &&
-                 tp_send_frame(tp->control_fd, type, payload, bytes);
+                 tp_peer_send_frame(tp, 0, type, payload, bytes);
     } else
 #endif
-        ok = tp_send_frame(tp->control_fd, type, payload, bytes);
+        ok = tp_peer_send_frame(tp, 0, type, payload, bytes);
     if (!ok) ds4_tp_mark_failed(tp);
     return ok;
 }
@@ -692,6 +757,173 @@ static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
     *type = h.type;
     *bytes = h.bytes;
     return 1;
+}
+
+/* ------------------------------------------------------------------------
+ * N-rank control fan-out.
+ *
+ * The lockstep protocol was written for one leader and one worker: every
+ * control frame is "send mine, receive theirs, require equality". With N
+ * ranks rank 0 holds world-1 sockets and a worker holds one, so the same
+ * protocol keeps its meaning if
+ *   - a send goes to every socket the rank owns, and
+ *   - a receive reads every socket and requires all the peers to agree.
+ * A worker therefore still sees one peer, and the leader sees the same frame
+ * from every worker. Bulk gate payloads never travel here at world > 2; they
+ * ride the ring collective (tp_ring_exchange), and the guard in
+ * tp_tcp_exchange_multi keeps that boundary explicit.
+ * --------------------------------------------------------------------- */
+
+static int tp_peer_write(ds4_tp *tp, int data, const void *buf, size_t bytes) {
+    const int *fds = data ? tp->peer_data : tp->peer_ctl;
+    for (int i = 0; i < tp->n_peer; i++)
+        if (!tp_write_full(fds[i], buf, bytes)) return 0;
+    return 1;
+}
+
+static int tp_peer_read(ds4_tp *tp, int data, void *buf, size_t bytes) {
+    const int *fds = data ? tp->peer_data : tp->peer_ctl;
+    if (tp->n_peer == 1) return tp_read_full(fds[0], buf, bytes);
+    unsigned char *tmp = malloc(bytes ? bytes : 1u);
+    if (!tmp) return 0;
+    int ok = 1;
+    for (int i = 0; ok && i < tp->n_peer; i++) {
+        unsigned char *dst = i == 0 ? (unsigned char *)buf : tmp;
+        ok = tp_read_full(fds[i], dst, bytes);
+        if (ok && i && memcmp(buf, tmp, bytes) != 0) {
+            fprintf(stderr,
+                    "ds4-tp: rank %d disagrees with rank %d on a %zu-byte "
+                    "control frame\n", tp->peer_rank[i], tp->peer_rank[0], bytes);
+            ok = 0;
+        }
+    }
+    free(tmp);
+    return ok;
+}
+
+static int tp_peer_send_frame(ds4_tp *tp, int data, uint32_t type,
+                              const void *payload, uint32_t bytes) {
+    const int *fds = data ? tp->peer_data : tp->peer_ctl;
+    for (int i = 0; i < tp->n_peer; i++)
+        if (!tp_send_frame(fds[i], type, payload, bytes)) return 0;
+    return 1;
+}
+
+/* Reads one frame from every peer, requiring identical headers and payloads,
+ * and returns the first peer's copy. */
+static int tp_peer_recv_frame(ds4_tp *tp, int data, uint32_t *type,
+                              unsigned char **payload, uint32_t *bytes) {
+    const int *fds = data ? tp->peer_data : tp->peer_ctl;
+    uint32_t t0 = 0, b0 = 0;
+    unsigned char *p0 = NULL;
+    if (!tp_read_frame_header(fds[0], &t0, &b0)) return 0;
+    if (b0) {
+        p0 = malloc(b0);
+        if (!p0 || !tp_read_full(fds[0], p0, b0)) { free(p0); return 0; }
+    }
+    unsigned char *tmp = NULL;
+    size_t tmp_bytes = 0;
+    int ok = 1;
+    for (int i = 1; ok && i < tp->n_peer; i++) {
+        uint32_t t = 0, b = 0;
+        ok = tp_read_frame_header(fds[i], &t, &b) && t == t0 && b == b0;
+        if (!ok) {
+            fprintf(stderr,
+                    "ds4-tp: rank %d sent a different control frame (%u/%u, "
+                    "rank %d sent %u/%u)\n", tp->peer_rank[i], t, b,
+                    tp->peer_rank[0], t0, b0);
+            break;
+        }
+        if (!b) continue;
+        if (tmp_bytes < b) {
+            unsigned char *grown = realloc(tmp, b);
+            if (!grown) { ok = 0; break; }
+            tmp = grown;
+            tmp_bytes = b;
+        }
+        ok = tp_read_full(fds[i], tmp, b) && memcmp(tmp, p0, b) == 0;
+        if (!ok)
+            fprintf(stderr, "ds4-tp: rank %d payload disagrees with rank %d\n",
+                    tp->peer_rank[i], tp->peer_rank[0]);
+    }
+    free(tmp);
+    if (!ok) { free(p0); return 0; }
+    *type = t0;
+    *bytes = b0;
+    *payload = p0;
+    return 1;
+}
+
+/* Header (+ optional small payload) exchange against every peer. Rank 0 sends
+ * to each worker in turn and then collects each worker's frame; a worker keeps
+ * the pairwise path. */
+static int tp_tcp_exchange_multi(ds4_tp *tp, ds4_tp_gate_header *header,
+                                 ds4_tp_gate_header *peer_header,
+                                 const void *out, void *in, size_t bytes) {
+    if (bytes > DS4_TP_SMALL_EXCHANGE_MAX) {
+        /* A gate payload would have to be reduced across N ranks; that is the
+         * ring's job. Only the small agreement frames (execution mode, DSpark
+         * metadata, sync checkpoints) may use the sockets at world > 2. */
+        fprintf(stderr,
+                "ds4-tp: %zu-byte payload exchange with %d peers is not "
+                "supported at world=%d; gate payloads must use the ring\n",
+                bytes, tp->n_peer, tp->world);
+        return 0;
+    }
+    if (header) {
+        for (int i = 0; i < tp->n_peer; i++)
+            if (!tp_write_full(tp->peer_data[i], header, sizeof(*header)))
+                return 0;
+    }
+    if (bytes && out) {
+        for (int i = 0; i < tp->n_peer; i++)
+            if (!tp_write_full(tp->peer_data[i], out, bytes)) return 0;
+    }
+    ds4_tp_gate_header first = {0, 0, 0, 0};
+    unsigned char *first_payload = NULL;
+    unsigned char *tmp = NULL;
+    int ok = 1;
+    if (bytes) {
+        first_payload = malloc(bytes);
+        tmp = malloc(bytes);
+        if (!first_payload || !tmp) ok = 0;
+    }
+    for (int i = 0; ok && i < tp->n_peer; i++) {
+        ds4_tp_gate_header got = {0, 0, 0, 0};
+        if (header) {
+            ok = tp_read_full(tp->peer_data[i], &got, sizeof(got));
+            if (!ok) break;
+            if (i == 0) {
+                first = got;
+            } else if (memcmp(&got, &first, sizeof(first)) != 0) {
+                fprintf(stderr,
+                        "ds4-tp: rank %d reported a different gate (%u/%u/%llu) "
+                        "than rank %d (%u/%u/%llu)\n",
+                        tp->peer_rank[i], got.layer, got.gate,
+                        (unsigned long long)got.seq,
+                        tp->peer_rank[0], first.layer, first.gate,
+                        (unsigned long long)first.seq);
+                ok = 0;
+                break;
+            }
+        }
+        if (!bytes) continue;
+        unsigned char *dst = i == 0 ? first_payload : tmp;
+        ok = tp_read_full(tp->peer_data[i], dst, bytes);
+        if (ok && i && memcmp(first_payload, tmp, bytes) != 0) {
+            fprintf(stderr,
+                    "ds4-tp: rank %d payload disagrees with rank %d on a "
+                    "%zu-byte agreement frame\n",
+                    tp->peer_rank[i], tp->peer_rank[0], bytes);
+            ok = 0;
+        }
+    }
+    if (ok && bytes && in) memcpy(in, first_payload, bytes);
+    else if (ok && bytes && !in) ok = 0;
+    free(first_payload);
+    free(tmp);
+    if (ok && peer_header) *peer_header = first;
+    return ok;
 }
 
 /* ------------------------------------------------------------------------
@@ -710,6 +942,8 @@ void ds4_tp_usage(FILE *fp) {
         "                              Gate transport (default auto). usb4-rdma\n"
         "                              selects the N-rank switchless-ring path.\n"
         "  --tp-world-size <n>         Ranks in the ring (default 2).\n"
+        "  --tp-rank <n>               This worker's rank, 1..world-1 (the\n"
+        "                              coordinator is rank 0). Default 1.\n"
         "  --tp-ring-ip <addr>         Control address of one rank; repeat in\n"
         "                              rank order (ring transports only).\n"
         "  --tp-cpu-core <n>           Pin the ring thread to core n. Default off.\n"
@@ -755,6 +989,18 @@ int ds4_tp_parse_cli_arg(
             return DS4_TP_CLI_ERROR;
         }
         opt->world_size = (int)v;
+    } else if (!strcmp(arg, "--tp-rank")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || errno != 0 ||
+            v < 1 || v >= DS4_TP_MAX_RANKS) {
+            tp_set_err(err, errlen, "%s needs an integer in 1..%d",
+                       arg, DS4_TP_MAX_RANKS - 1);
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->rank_index = (int)v;
     } else if (!strcmp(arg, "--tp-ring-ip")) {
         if (i + 1 >= argc) goto missing;
         int slot = 0;
@@ -888,19 +1134,49 @@ int ds4_tp_validate_engine_options(
         return 1;
     }
     if (opt->tp.world_size > 2) {
-        /* The collective transport for N ranks is implemented and tested
-         * (tests/test_tp_ring), but the weight/graph split around it is not:
-         * ds4_cuda.cu's derived-artifact builder rejects world != 2, ds4.c's
-         * attention/FFN/shared-expert splits are gated on tp_world == 2, and
-         * the logits split is a fixed two-way halving. Refuse rather than run
-         * a wrong split. */
+        /* N-rank tensor parallelism runs the expert split over the switchless
+         * ring: rank r owns experts [first, first+count) of every layer, and
+         * every gate payload is all-reduced across all ranks (tp_ring_exchange).
+         * Only the ROCm graph is generalized: it replicates attention and
+         * computes the output projection on every rank. The CUDA/Metal
+         * derived-artifact builders, the attention head split and the two-way
+         * logits halving are still 2-rank, so they are refused here instead of
+         * silently producing a wrong split. */
+#if !defined(DS4_ROCM_BUILD)
         tp_set_err(err, errlen,
-                   "tp: --tp-world-size %d is not supported yet: the expert, "
-                   "attention and FFN sharding (ds4.c) plus the CUDA "
-                   "derived-artifact builder are still 2-rank; only the ring "
-                   "collective transport is generalized",
+                   "tp: --tp-world-size %d is implemented for the ROCm backend "
+                   "only (the CUDA/Metal attention head split, logits halving "
+                   "and derived-artifact builder are 2-rank)",
                    opt->tp.world_size);
         return 0;
+#else
+        if (opt->tp.transport != DS4_TP_TRANSPORT_USB4_RDMA &&
+            opt->tp.transport != DS4_TP_TRANSPORT_TCP) {
+            tp_set_err(err, errlen,
+                       "tp: --tp-world-size %d needs --transport usb4-rdma or "
+                       "--transport tcp (the ring collective); the pairwise "
+                       "verbs path is 2-rank", opt->tp.world_size);
+            return 0;
+        }
+        if (opt->tp.ring_ip[opt->tp.world_size - 1] == NULL) {
+            tp_set_err(err, errlen,
+                       "tp: --tp-world-size %d needs %d --tp-ring-ip addresses "
+                       "in rank order", opt->tp.world_size, opt->tp.world_size);
+            return 0;
+        }
+        if (opt->tp.rank_index < 0 || opt->tp.rank_index >= opt->tp.world_size) {
+            tp_set_err(err, errlen,
+                       "tp: --tp-rank must be in 0..%d", opt->tp.world_size - 1);
+            return 0;
+        }
+        if ((opt->tp.role == DS4_TP_LEADER) != (opt->tp.rank_index == 0)) {
+            tp_set_err(err, errlen,
+                       "tp: rank 0 is the coordinator and every other rank is a "
+                       "worker (--tp-rank %d with --role %s)", opt->tp.rank_index,
+                       opt->tp.role == DS4_TP_LEADER ? "coordinator" : "worker");
+            return 0;
+        }
+#endif
     }
     /* --transport usb4-rdma is allowed at world=2: the payload plane is the
      * degenerate 2-rank USB4 ring (tp_ring_start). world>2 is still refused
@@ -2528,7 +2804,12 @@ static void tp_rdma_close(ds4_tp *tp) {
  * Bring-up.
  * --------------------------------------------------------------------- */
 
-static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
+/* One hello per accepted/dialed socket. `expect_rank` >= 0 requires the peer to
+ * announce that rank (the leader binds an accepted socket to the rank the
+ * worker claims); the geometry is taken from the local identity, which every
+ * rank validates to be the same. */
+static int tp_hello_exchange(ds4_tp *tp, int fd, const ds4_tp_identity *id,
+                             int rdma_ok, int expect_rank, int *peer_rank_out,
                              char *err, size_t errlen) {
     ds4_tp_hello_fixed mine = {
         .magic = DS4_TP_MAGIC,
@@ -2545,6 +2826,8 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .gate_slot_start = id->gate_slot_start,
         .gate_slot_step = id->gate_slot_step,
         .gates_per_token = id->gates_per_token,
+        .rank = (uint32_t)tp->rank,
+        .world = (uint32_t)tp->world,
 #if defined(DS4_TP_HAVE_VERBS) && defined(__linux__)
         .rdma_max_msg = getenv("DS4_TP_DISABLE_RC_LARGE_MESSAGES") ? 16384u : 65536u,
 #endif
@@ -2552,8 +2835,8 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     memcpy(mine.gate_slot_mask, id->gate_slot_mask,
            sizeof(mine.gate_slot_mask));
     ds4_tp_hello_fixed theirs;
-    if (!tp_write_full(tp->control_fd, &mine, sizeof(mine)) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
+    if (!tp_write_full(fd, &mine, sizeof(mine)) ||
+        !tp_read_full(fd, &theirs, sizeof(theirs))) {
         tp_set_err(err, errlen, "tp hello exchange failed");
         return 0;
     }
@@ -2570,6 +2853,22 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         tp_set_err(err, errlen, "tp hello: both sides claim role %u", mine.role);
         return 0;
     }
+    if (theirs.world != mine.world) {
+        tp_set_err(err, errlen, "tp hello: rank %u runs --tp-world-size %u, this "
+                   "rank runs %u", theirs.rank, theirs.world, mine.world);
+        return 0;
+    }
+    if (theirs.rank == mine.rank || theirs.rank >= mine.world) {
+        tp_set_err(err, errlen, "tp hello: peer claims rank %u of %u, this rank is %u",
+                   theirs.rank, mine.world, mine.rank);
+        return 0;
+    }
+    if (expect_rank >= 0 && theirs.rank != (uint32_t)expect_rank) {
+        tp_set_err(err, errlen, "tp hello: expected rank %d to connect, rank %u did",
+                   expect_rank, theirs.rank);
+        return 0;
+    }
+    if (peer_rank_out) *peer_rank_out = (int)theirs.rank;
     if (theirs.gguf_bytes != mine.gguf_bytes || theirs.model_id != mine.model_id ||
         theirs.n_layer != mine.n_layer || theirs.n_embd != mine.n_embd ||
         theirs.n_vocab != mine.n_vocab || theirs.quant_bits != mine.quant_bits ||
@@ -2611,7 +2910,9 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
      * cannot sustain two-sided SEND/RECV. */
     int want_rdma = tp->opt.transport == DS4_TP_TRANSPORT_AUTO ||
                     tp->opt.transport == DS4_TP_TRANSPORT_RDMA;
-    tp->rdma_active = want_rdma && rdma_ok && theirs.rdma_ok;
+    /* The two-sided verbs path pairs exactly two ranks; world>2 always reduces
+     * through the ring, so it can never turn rdma_active on. */
+    tp->rdma_active = want_rdma && rdma_ok && theirs.rdma_ok && tp->world == 2;
 #ifdef DS4_TP_HAVE_VERBS
     tp->rdma.max_msg = tp_rdma_negotiate_max_msg(mine.rdma_max_msg, theirs.rdma_max_msg);
     if (tp->rdma_active && !tp->rdma.max_msg) {
@@ -2636,23 +2937,21 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
  * control addresses are the connected endpoints' 5GbE addresses, so a
  * wildcard --listen and hostnames both work; --tp-ring-ip overrides them in
  * rank order (leader, worker). */
-static int tp_ring_start(ds4_tp *tp, char *err, size_t errlen) {
-    if (tp->opt.world_size != 2) {
-        tp_set_err(err, errlen,
-                   "transport usb4-rdma needs --tp-world-size 2 (got %d): the ring "
-                   "payload plane is 2-rank only", tp->opt.world_size);
+static int tp_ring_start(ds4_tp *tp, bool force_tcp, char *err, size_t errlen) {
+    const int world = tp->world;
+    char ip[DS4_TP_MAX_RANKS][64];
+    memset(ip, 0, sizeof(ip));
+    int have = 0;
+    while (have < DS4_TP_MAX_RANKS && tp->opt.ring_ip[have]) have++;
+    if (have && have != world) {
+        tp_set_err(err, errlen, "ring: --tp-ring-ip must be passed once per rank "
+                   "(%d for --tp-world-size %d, got %d)", world, world, have);
         return 0;
     }
-    char leader_ip[64] = "", worker_ip[64] = "";
-    if (tp->opt.ring_ip[0] && !tp->opt.ring_ip[1]) {
-        tp_set_err(err, errlen, "transport usb4-rdma: --tp-ring-ip must be "
-                   "passed twice (leader, then worker)");
-        return 0;
-    }
-    if (tp->opt.ring_ip[0] && tp->opt.ring_ip[1]) {
-        snprintf(leader_ip, sizeof(leader_ip), "%s", tp->opt.ring_ip[0]);
-        snprintf(worker_ip, sizeof(worker_ip), "%s", tp->opt.ring_ip[1]);
-    } else {
+    if (have == world) {
+        for (int i = 0; i < world; i++)
+            snprintf(ip[i], sizeof(ip[i]), "%s", tp->opt.ring_ip[i]);
+    } else if (world == 2) {
         struct sockaddr_in peer_addr, local_addr;
         socklen_t peer_len = sizeof(peer_addr), local_len = sizeof(local_addr);
         char peer_ip[64] = "", local_ip[64] = "";
@@ -2661,29 +2960,34 @@ static int tp_ring_start(ds4_tp *tp, char *err, size_t errlen) {
             peer_addr.sin_family != AF_INET || local_addr.sin_family != AF_INET ||
             !inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip)) ||
             !inet_ntop(AF_INET, &local_addr.sin_addr, local_ip, sizeof(local_ip))) {
-            tp_set_err(err, errlen, "transport usb4-rdma: cannot read the control "
-                       "socket addresses; pass --tp-ring-ip twice");
+            tp_set_err(err, errlen, "ring: cannot read the control "
+                       "socket addresses; pass --tp-ring-ip once per rank");
             return 0;
         }
         /* Rank order is leader first, worker second, on both nodes. */
-        snprintf(leader_ip, sizeof(leader_ip), "%s",
-                 tp->rank == 0 ? local_ip : peer_ip);
-        snprintf(worker_ip, sizeof(worker_ip), "%s",
-                 tp->rank == 0 ? peer_ip : local_ip);
-    }
-    if (!leader_ip[0] || !worker_ip[0]) {
-        tp_set_err(err, errlen, "transport usb4-rdma: empty control address");
+        snprintf(ip[0], sizeof(ip[0]), "%s", tp->rank == 0 ? local_ip : peer_ip);
+        snprintf(ip[1], sizeof(ip[1]), "%s", tp->rank == 0 ? peer_ip : local_ip);
+    } else {
+        tp_set_err(err, errlen,
+                   "ring: --tp-world-size %d needs %d --tp-ring-ip addresses",
+                   world, world);
         return 0;
+    }
+    for (int i = 0; i < world; i++) {
+        if (!ip[i][0]) {
+            tp_set_err(err, errlen, "ring: empty control address for rank %d", i);
+            return 0;
+        }
     }
 
     ds4_tp_ring_options ro;
     memset(&ro, 0, sizeof(ro));
     ro.rank = tp->rank;
-    ro.world = 2;
-    ro.control_ip[0] = leader_ip;
-    ro.control_ip[1] = worker_ip;
+    ro.world = world;
+    for (int i = 0; i < world; i++) ro.control_ip[i] = ip[i];
     ro.port = tp->rank == 0 ? tp->opt.listen_port : tp->opt.leader_port;
     ro.gid_index = -1;              /* first IPv4-mapped GID (index 1 here) */
+    ro.force_tcp = force_tcp;
     /* 512 KiB per rank: the ring registers world*chunk + 8*chunk bytes of host
      * memory, and the container's RLIMIT_MEMLOCK is 8 MiB, so this is the
      * largest chunk that both fits the limit and keeps prefill passes few.
@@ -2704,18 +3008,23 @@ static int tp_ring_start(ds4_tp *tp, char *err, size_t errlen) {
 
     if (ds4_tp_ring_create(&tp->ring, &ro, err, errlen) != 0) return 0;
     const ds4_tp_ring_backend backend = ds4_tp_ring_get_backend(tp->ring);
-    if (backend != DS4_TP_RING_BACKEND_USB4) {
+    /* --transport usb4-rdma insists on the USB4 backend; --transport tcp at
+     * world>2 is the A/B control that insists on the TCP backend instead. */
+    if (force_tcp ? backend != DS4_TP_RING_BACKEND_TCP :
+                    backend != DS4_TP_RING_BACKEND_USB4) {
         tp_set_err(err, errlen,
-                   "transport usb4-rdma: the ring came up on %s, not USB4 RDMA "
-                   "(rebuild with USE_USB4_RDMA=1 and check the USB4 HCAs/GIDs)",
-                   ds4_tp_ring_backend_name(backend));
+                   "ring: came up on %s, expected %s (rebuild with "
+                   "USE_USB4_RDMA=1 and check the USB4 HCAs/GIDs for usb4-rdma)",
+                   ds4_tp_ring_backend_name(backend),
+                   force_tcp ? "the TCP ring" : "USB4 RDMA");
         ds4_tp_ring_destroy(tp->ring);
         tp->ring = NULL;
         return 0;
     }
-    fprintf(stderr, "ds4-tp: payload plane usb4-rdma over USB4 ring: "
-            "leader=%s worker=%s base-port=%d chunk=%zu B\n",
-            leader_ip, worker_ip, ro.port, ro.chunk_bytes);
+    fprintf(stderr, "ds4-tp: payload plane %s over the %d-rank ring: "
+            "base-port=%d chunk=%zu B\n",
+            force_tcp ? "tcp" : "usb4-rdma", world, ro.port, ro.chunk_bytes);
+    for (int i = 0; i < world; i++) fprintf(stderr, "ds4-tp:   rank %d control %s\n", i, ip[i]);
     return 1;
 }
 
@@ -2737,9 +3046,17 @@ int ds4_tp_create(
      * is only written when the flag is present. Normalize it so the transport
      * checks see the effective world size. */
     if (tp->opt.world_size == 0) tp->opt.world_size = 2;
-    tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
+    tp->world = tp->opt.world_size > 1 ? tp->opt.world_size : 2;
+    tp->rank = opt->role == DS4_TP_LEADER ? 0 :
+               (tp->opt.rank_index > 0 ? tp->opt.rank_index : 1);
+    tp->n_peer = 0;
     tp->control_fd = -1;
     tp->data_fd = -1;
+    for (int i = 0; i < DS4_TP_MAX_RANKS; i++) {
+        tp->peer_ctl[i] = -1;
+        tp->peer_data[i] = -1;
+        tp->peer_rank[i] = -1;
+    }
     tp->xchg_stats = getenv("DS4_TP_XCHG_STATS") != NULL;
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
@@ -2759,24 +3076,63 @@ int ds4_tp_create(
 #endif
 
     int listener = -1;
+    int data_listener = -1;
+    /* At world>2 the data sockets get their own port: with several workers the
+     * accept order no longer proves which connection is which, so the two
+     * phases cannot share one listener. world=2 keeps the single-port
+     * bring-up that the pairwise path has always used. */
+    const bool split_ports = tp->world > 2;
     if (tp->rank == 0) {
         listener = tp_listen(opt->listen_host, opt->listen_port, err, errlen);
         if (listener < 0) goto fail;
-        fprintf(stderr, "ds4-tp: waiting for worker on %s:%d ...\n",
-                opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
-        tp->control_fd = accept(listener, NULL, NULL);
-        if (tp->control_fd < 0) {
-            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
-            goto fail;
+        if (split_ports) {
+            data_listener = tp_listen(opt->listen_host, opt->listen_port + 1, err, errlen);
+            if (data_listener < 0) goto fail;
         }
+        fprintf(stderr, "ds4-tp: waiting for %d worker(s) on %s:%d ...\n",
+                tp->world - 1,
+                opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
+        /* One control socket per worker. Workers may connect in any order, so
+         * the hello's rank decides the slot; a duplicate rank is a wiring
+         * error, not a race to resolve. */
+        for (int i = 0; i < tp->world - 1; i++) {
+            const int fd = accept(listener, NULL, NULL);
+            if (fd < 0) {
+                tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+                goto fail;
+            }
+            tp_socket_tune(fd);
+            int peer_rank = -1;
+            if (!tp_hello_exchange(tp, fd, id, rdma_ok, -1, &peer_rank, err, errlen)) {
+                close(fd);
+                goto fail;
+            }
+            if (peer_rank < 1 || peer_rank >= tp->world ||
+                tp->peer_ctl[peer_rank - 1] >= 0) {
+                tp_set_err(err, errlen,
+                           "tp hello: rank %d connected twice or out of range",
+                           peer_rank);
+                close(fd);
+                goto fail;
+            }
+            tp->peer_ctl[peer_rank - 1] = fd;
+            tp->peer_rank[peer_rank - 1] = peer_rank;
+            tp->n_peer++;
+            fprintf(stderr, "ds4-tp: rank %d connected (%d/%d)\n",
+                    peer_rank, tp->n_peer, tp->world - 1);
+        }
+        tp->control_fd = tp->peer_ctl[0];
     } else {
         tp->control_fd = tp_dial(opt->leader_host, opt->leader_port,
                                  (double)tp->timeout_sec, err, errlen);
         if (tp->control_fd < 0) goto fail;
+        tp_socket_tune(tp->control_fd);
+        if (!tp_hello_exchange(tp, tp->control_fd, id, rdma_ok, 0, NULL, err, errlen))
+            goto fail;
+        tp->peer_ctl[0] = tp->control_fd;
+        tp->peer_rank[0] = 0;
+        tp->n_peer = 1;
     }
-    tp_socket_tune(tp->control_fd);
-
-    if (!tp_hello_exchange(tp, id, rdma_ok, err, errlen)) goto fail;
 
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) {
@@ -2788,34 +3144,75 @@ int ds4_tp_create(
          * interleave with gate payloads.  Created under RDMA too for
          * headers, verify-block gates, and transport fallback. */
         if (tp->rank == 0) {
-            tp->data_fd = accept(listener, NULL, NULL);
-            if (tp->data_fd < 0) {
-                tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
-                goto fail;
+            /* Workers dial their data socket right after their hello and
+             * announce their rank as the first four bytes, because the accept
+             * order is not the rank order. */
+            const int from = split_ports ? data_listener : listener;
+            for (int i = 0; i < tp->n_peer; i++) {
+                const int fd = accept(from, NULL, NULL);
+                if (fd < 0) {
+                    tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
+                    goto fail;
+                }
+                uint32_t peer_rank = 0;
+                if (split_ports) {
+                    if (!tp_read_full(fd, &peer_rank, sizeof(peer_rank)) ||
+                        peer_rank < 1 || peer_rank >= (uint32_t)tp->world ||
+                        tp->peer_data[peer_rank - 1] >= 0) {
+                        tp_set_err(err, errlen, "tp data accept: bad rank tag");
+                        close(fd);
+                        goto fail;
+                    }
+                    peer_rank -= 1u;
+                } else {
+                    peer_rank = 0;
+                }
+                tp_socket_tune(fd);
+                if (!tp_socket_set_gate_timeout(fd, tp->gate_timeout_ms)) {
+                    tp_set_err(err, errlen, "tp data socket timeout: %s", strerror(errno));
+                    close(fd);
+                    goto fail;
+                }
+                tp->peer_data[peer_rank] = fd;
             }
+            tp->data_fd = tp->peer_data[0];
         } else {
-            tp->data_fd = tp_dial(opt->leader_host, opt->leader_port,
+            const int data_port = split_ports ? opt->leader_port + 1 : opt->leader_port;
+            tp->data_fd = tp_dial(opt->leader_host, data_port,
                                   (double)tp->timeout_sec, err, errlen);
             if (tp->data_fd < 0) goto fail;
-        }
-        tp_socket_tune(tp->data_fd);
-        if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms)) {
-            tp_set_err(err, errlen, "tp data socket timeout: %s", strerror(errno));
-            goto fail;
+            tp_socket_tune(tp->data_fd);
+            if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms)) {
+                tp_set_err(err, errlen, "tp data socket timeout: %s", strerror(errno));
+                goto fail;
+            }
+            if (split_ports) {
+                const uint32_t tag = (uint32_t)tp->rank;
+                if (!tp_write_full(tp->data_fd, &tag, sizeof(tag))) {
+                    tp_set_err(err, errlen, "tp data socket rank tag failed");
+                    goto fail;
+                }
+            }
+            tp->peer_data[0] = tp->data_fd;
         }
     }
     if (listener >= 0) close(listener);
-    if (tp->opt.transport == DS4_TP_TRANSPORT_USB4_RDMA) {
-        if (!tp_ring_start(tp, err, errlen)) goto fail;
+    if (data_listener >= 0) close(data_listener);
+    if (tp->opt.transport == DS4_TP_TRANSPORT_USB4_RDMA || tp->world > 2) {
+        const bool force_tcp = tp->opt.transport == DS4_TP_TRANSPORT_TCP;
+        if (!tp_ring_start(tp, force_tcp, err, errlen)) goto fail;
     }
-    fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
-            tp->rank == 0 ? "worker" : "leader",
-            tp->ring ? "usb4-rdma" : tp->rdma_active ? "rdma" : "tcp",
+    fprintf(stderr, "ds4-tp: rank %d/%d connected, transport=%s gate-timeout=%llums\n",
+            tp->rank, tp->world,
+            tp->ring ? (tp->world > 2 && tp->opt.transport == DS4_TP_TRANSPORT_TCP ?
+                        "tcp-ring" : "usb4-rdma") :
+            tp->rdma_active ? "rdma" : "tcp",
             (unsigned long long)tp->gate_timeout_ms);
     *out = tp;
     return 1;
 fail:
     if (listener >= 0) close(listener);
+    if (data_listener >= 0) close(data_listener);
     ds4_tp_free(tp);
     return 0;
 }
@@ -2835,9 +3232,9 @@ int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, bool *full_experts, 
         DS4_TP_MODE_V41_DSPARK;
     if (peer[0] != mine[0] || (peer[1] & ~full) != flags || (flags & ~known) != 0) {
         ds4_tp_mark_failed(tp);
-        tp_set_err(err, errlen, "tp execution mode mismatch (peer 0x%x, local 0x%x); "
-                   "use matching builds and expert ownership settings on both ranks",
-                   peer[1], flags);
+        tp_set_err(err, errlen, "tp execution mode mismatch (peer 0x%x/0x%x, local "
+                   "0x%x/0x%x); use matching builds and expert ownership settings on "
+                   "both ranks", peer[0], peer[1], mine[0], flags);
         return 0;
     }
     if (full_experts) *full_experts = (mine[1] & peer[1] & full) != 0;
@@ -2879,8 +3276,16 @@ void ds4_tp_free(ds4_tp *tp) {
 #ifdef DS4_TP_HAVE_VERBS
     tp_rdma_close(tp);
 #endif
-    if (tp->control_fd >= 0) close(tp->control_fd);
-    if (tp->data_fd >= 0) close(tp->data_fd);
+    for (int i = 0; i < tp->n_peer; i++) {
+        if (tp->peer_ctl[i] >= 0) close(tp->peer_ctl[i]);
+        if (tp->peer_data[i] >= 0) close(tp->peer_data[i]);
+        tp->peer_ctl[i] = -1;
+        tp->peer_data[i] = -1;
+    }
+    if (tp->control_fd >= 0 && tp->n_peer == 0) close(tp->control_fd);
+    if (tp->data_fd >= 0 && tp->n_peer == 0) close(tp->data_fd);
+    tp->control_fd = -1;
+    tp->data_fd = -1;
     free(tp);
 }
 
@@ -2895,6 +3300,7 @@ void ds4_tp_detach_slab(ds4_tp *tp) {
 }
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
+int ds4_tp_world(const ds4_tp *tp) { return tp ? tp->world : 1; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
 bool ds4_tp_is_usb4_ring(const ds4_tp *tp) { return tp && tp->ring != NULL; }
 #ifndef DS4_TP_HAVE_VERBS
@@ -2914,6 +3320,9 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
 
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     if (!tp || ds4_tp_failed(tp)) return 0;
+    if (getenv("DS4_TP_TRACE_GATES"))
+        fprintf(stderr, "ds4-tp: gate row l=%u g=%u seq=%llu\n", layer, gate,
+                (unsigned long long)seq);
     const double t_whole = tp->xchg_stats ? tp_now_sec() : 0.0;
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
@@ -3124,6 +3533,9 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (!tp || ds4_tp_failed(tp)) return 0;
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+    if (getenv("DS4_TP_TRACE_GATES"))
+        fprintf(stderr, "ds4-tp: gate big l=%u seq=%llu bytes=%llu\n", layer,
+                (unsigned long long)seq, (unsigned long long)bytes);
 #ifdef DS4_TP_HAVE_VERBS
     static int dbg = -1;
     if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
@@ -3145,15 +3557,21 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
         }
         if (arrival_ms < tp->gate_timeout_ms + 2000u) arrival_ms = tp->gate_timeout_ms + 2000u;
     }
-    if (!tp_socket_set_gate_timeout(tp->data_fd, arrival_ms)) return 0;
+    /* Rank 0 addresses every worker in turn, so the arrival slack applies to
+     * each socket; a worker has the one leader socket. */
+    for (int i = 0; i < tp->n_peer; i++)
+        if (!tp_socket_set_gate_timeout(tp->peer_data[i], arrival_ms)) return 0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
-    ds4_tp_gate_header ph;
-    const bool header_ok = tp_write_full(tp->data_fd, &h, sizeof(h)) &&
-        tp_read_full(tp->data_fd, &ph, sizeof(ph));
+    ds4_tp_gate_header ph = {0, 0, 0, 0};
+    const bool header_ok = tp_peer_write(tp, 1, &h, sizeof(h)) &&
+        tp_peer_read(tp, 1, &ph, sizeof(ph));
     if (!header_ok)
         fprintf(stderr, "ds4-tp: big gate header exchange failed or peer closed (layer %u seq %llu): %s\n",
                 layer, (unsigned long long)seq, strerror(errno));
-    const bool timeout_restored = tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms);
+    bool timeout_restored = true;
+    for (int i = 0; i < tp->n_peer; i++)
+        if (!tp_socket_set_gate_timeout(tp->peer_data[i], tp->gate_timeout_ms))
+            timeout_restored = false;
     if (!header_ok || !timeout_restored) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     const double t_hs = dbg ? tp_now_sec() : 0.0;
@@ -3461,14 +3879,19 @@ int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
                                const char *operation, char *err, size_t errlen) {
     uint32_t type = 0, bytes = 0;
     ds4_tp_command_ack ack;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
-        !tp_read_full(tp->control_fd, &ack, sizeof(ack))) {
+    unsigned char *payload = NULL;
+    /* Every worker answers; the fan-in requires them all to report the same
+     * status, so a single failed rank fails the collective. */
+    if (!tp_peer_recv_frame(tp, 0, &type, &payload, &bytes) ||
+        type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack)) {
+        free(payload);
         ds4_tp_mark_failed(tp);
         tp_set_err(err, errlen, "tp: worker failed during %s",
                    operation ? operation : "command");
         return 0;
     }
+    memcpy(&ack, payload, sizeof(ack));
+    free(payload);
     if (ack.session_id != session_id || ack.reserved != 0) {
         ds4_tp_mark_failed(tp);
         tp_set_err(err, errlen,
@@ -3502,14 +3925,16 @@ int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
         uint32_t point;
         int32_t current, total;
         uint32_t cancelled;
-    } local = {++tp->sync_checkpoint_seq, point, current, total, requested}, peer;
-    uint32_t type, bytes;
-    if (ds4_tp_failed(tp) ||
-        !tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_CHECKPOINT, &local, sizeof(local)) ||
-        !tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_SYNC_CHECKPOINT || bytes != sizeof(peer) ||
-        !tp_read_full(tp->control_fd, &peer, sizeof(peer)) ||
-        peer.seq != local.seq || peer.point != point ||
+    } local = {++tp->sync_checkpoint_seq, point, current, total, requested}, peer = {0};
+    uint32_t type = 0, bytes = 0;
+    unsigned char *payload = NULL;
+    const bool got = !ds4_tp_failed(tp) &&
+        tp_peer_send_frame(tp, 0, DS4_TP_FRAME_SYNC_CHECKPOINT, &local, sizeof(local)) &&
+        tp_peer_recv_frame(tp, 0, &type, &payload, &bytes) &&
+        type == DS4_TP_FRAME_SYNC_CHECKPOINT && bytes == sizeof(peer);
+    if (got) memcpy(&peer, payload, sizeof(peer));
+    free(payload);
+    if (!got || peer.seq != local.seq || peer.point != point ||
         peer.current != current || peer.total != total || peer.cancelled > 1u) {
         ds4_tp_mark_failed(tp);
         return 0;
@@ -3800,6 +4225,12 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
 }
 
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
+    if (!tp || tp->world != 2) {
+        /* world>2 disables the two-way logits halving: every rank projects the
+         * full vocabulary, so there is no half to cross the wire. */
+        fprintf(stderr, "ds4-tp: logits halves are a 2-rank split\n");
+        return 0;
+    }
     ds4_tp_frame_header h = { DS4_TP_MAGIC, DS4_TP_FRAME_LOGITS,
                               count * (uint32_t)sizeof(float) };
     return tp_write_full(tp->control_fd, &h, sizeof(h)) &&
@@ -3808,6 +4239,7 @@ int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
 
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
     uint32_t type = 0, bytes = 0;
+    if (!tp || tp->world != 2) return 0;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
         fprintf(stderr, "ds4-tp: bad logits frame (type %u bytes %u)\n", type, bytes);
@@ -3987,15 +4419,18 @@ int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count) {
 }
 
 int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen) {
-    struct { uint64_t seq; uint64_t hash; } mine = { seq, hash }, theirs;
-    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
+    struct { uint64_t seq; uint64_t hash; } mine = { seq, hash }, theirs = {0, 0};
+    if (!tp_peer_send_frame(tp, 0, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
         tp_set_err(err, errlen, "tp: hash send failed");
         return 0;
     }
     uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
+    unsigned char *payload = NULL;
+    const bool got = tp_peer_recv_frame(tp, 0, &type, &payload, &bytes) &&
+        type == DS4_TP_FRAME_HASH && bytes == sizeof(theirs);
+    if (got) memcpy(&theirs, payload, sizeof(theirs));
+    free(payload);
+    if (!got) {
         tp_set_err(err, errlen, "tp: hash recv failed");
         return 0;
     }

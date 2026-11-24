@@ -597,16 +597,23 @@ static int routed_moe_launch(
         uint32_t n_tokens,
         bool force_resident,
         int owned_filtered) {
-    /* Network tensor parallelism: this rank stores one contiguous half of every
+    /* Network tensor parallelism: this rank stores one contiguous slice of every
      * layer's routed experts.  Filter the router selection to the owned window
      * and rebase the expert-table offsets onto it, so a peer-owned expert is
      * never read (and its bytes never have to be resident).  Mirrors the CUDA
-     * gate at ds4_cuda.cu's routed_moe_launch. */
+     * gate at ds4_cuda.cu's routed_moe_launch.
+     *
+     * The slice is n_total_expert/world wide and the remainder goes to the
+     * lowest ranks, so the world=2 case is exactly the historical halves:
+     * rank 0 [0, n/2), rank 1 [n/2, n). */
     ds4_gpu_tensor local_ids = {}, local_weights = {};
     if (!owned_filtered && g_network_tp_rank >= 0 && !g_network_tp_sharding_suspended) {
-        const uint32_t half = n_total_expert / 2u;
-        const uint32_t first = g_network_tp_rank ? half : 0u;
-        const uint32_t count = g_network_tp_rank ? n_total_expert - half : half;
+        const uint32_t world = g_network_tp_world > 0 ? (uint32_t)g_network_tp_world : 1u;
+        const uint32_t rank = (uint32_t)g_network_tp_rank;
+        const uint32_t base = n_total_expert / world;
+        const uint32_t rem = n_total_expert % world;
+        const uint32_t first = rank * base + (rank < rem ? rank : rem);
+        const uint32_t count = base + (rank < rem ? 1u : 0u);
         uint64_t pairs = 0;
         if (!count || !gate_expert_bytes || !down_expert_bytes ||
             !cuda_u64_mul_checked(n_tokens, n_expert, &pairs) ||

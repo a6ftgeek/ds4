@@ -19,21 +19,19 @@
 #   checkpoint is rejected at ds4.c:74106 ("--vision requires ... the pinned
 #   DeepSeek V4 Flash Vision-Exp or V4.1 Flash model"), and V4.1 vision itself
 #   is Metal-only (ds4.c:74034). The 0731 weights carry no vision projection.
-# DSpark: OFF by default (DSPARK=1 turns it on). The N-rank verify path works:
-#   every worker rank mirrors the leader's block, and at world=4 the generated
-#   text is byte-identical to the non-speculative run on both the coding and
-#   the prose prompt (64 tokens). It is not a bottleneck win yet -- the world=4
-#   verifier has no batched gate path (tp_batch_rows is world=2 only), so a
-#   verify block costs ~870 ms/cycle against a 109 ms decode token:
-#     TP=4 coding  9.15 -> 4.00 t/s (-56.3%, accept 80.95%)
-#     TP=4 prose   9.23 -> 4.18 t/s (-54.7%, accept 96.00%)
-#     TP=4 prose with DS4_DSPARK_SEED_BATCH=0: 6.51 t/s (-29.5%)
-#   TP=2 coding is the one net win (10.04 -> 14.53 t/s, +44.7%, accept 92.50%).
-#   The canonical 16-token greedy md5 (a13ba035...) matches with
-#   DS4_DSPARK_SEED_BATCH=0 only; the default fused seed batch keeps the
-#   batched-verifier floating-point order and flips one near-tie word, as
-#   docs/SPECULATIVE_DECODING.md already warns. Numbers and the audit are in
-#   dsbench/usb4-rdma/FEATURE_STATUS.md.
+# DSpark: OFF by default (DSPARK=1 turns it on). The N-rank verify gate is
+#   generalized (tp_batch_rows is set for world>=2), so a world=4 verify block
+#   now uses the same batched per-layer gate as world=2 instead of the per-layer
+#   bulk exchange: verify 742 -> ~320 ms/cycle on coding and TP=4 DSpark goes
+#   4.00-4.18 -> 7.22-7.98 t/s. It is still a net loss against 9.4-9.5 t/s:
+#     TP=4 coding  9.45 -> 7.22 t/s (-24%, accept 82.50%, 33/40)
+#     TP=4 prose   9.35 -> 7.98 t/s (-15%, accept 90.00%, 9/10)
+#   The canonical 16-token greedy md5 (a13ba035...) and the coding 64-token md5
+#   (4a10b554...) match the non-speculative run with seed batches on or off.
+#   The prose continuation differs (de52e3b2 vs e728672c): that is the batched
+#   verifier's reduction order and is identical to TP=2 DSpark, which already
+#   behaves this way. TP=2 coding remains the one net win (10.04 -> 14.45 t/s).
+#   Remaining gap and the audit are in dsbench/usb4-rdma/FEATURE_STATUS.md.
 #
 # usage: bash launch_tp4_best.sh [prompt-file] [n_tokens]
 # env:   CTX (default 1048576), TP_CORE (2), PORT (19730), TIMEOUT (3600),

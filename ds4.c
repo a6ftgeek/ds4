@@ -33512,8 +33512,8 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint32_t tp_batch_slot = g->tp_verify_heads ? 2u * il + 1u : il;
     /* The negotiated policy covers both splits: a diagnostic on just one
      * rank must not change whether the exchanged FFN includes shared work. */
-    const bool tp_shared_slice = g->tp_verify_heads && tp_split_ffn &&
-                                 g->tp_batch_rows == n_tokens;
+    const bool tp_shared_slice = g->tp_world == 2 && g->tp_verify_heads &&
+                                 tp_split_ffn && g->tp_batch_rows == n_tokens;
     /* Every rank owns a disjoint, balanced slice of the chunk rows and
      * evaluates the replicated shared expert only for those rows, folding
      * them into the same rows of its routed partial ("own rows").  The bulk
@@ -33772,9 +33772,15 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
 #endif
 
+    /* The verify-block batch gate carries whole-row float32 partials, one
+     * block of `n_tokens` rows per layer, and the payload plane all-reduces
+     * it across every rank (tp_ring_exchange: at world>2 the caller receives
+     * total - own, so `tp_batch_out + tp_batch_in` is still the full sum).
+     * Nothing here assumes two ranks or an even row count, so it runs at any
+     * world >= 2. */
     const bool tp_split_batch_moe =
         g->tp_batch_rows == n_tokens && n_tokens > 0 &&
-        g->tp_world == 2 &&
+        g->tp_world >= 2 &&
         g->tp_batch_out && g->tp_batch_in;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     const bool tp_batched_backend = true;
@@ -39467,7 +39473,12 @@ static bool metal_graph_verify_suffix_tops_impl(
     /* Both ranks verify against their resident experts. CUDA can also split
      * attention heads, using a second gate while retaining replicated KV and
      * indexer state. Agree that choice before either rank encodes the block. */
-    g->tp_batch_rows = (g->tp_world == 2 &&
+    /* Batched verify gate: every rank exchanges its whole-row routed partial
+     * for the block in one transfer per layer, reduced across the world. The
+     * slab holds DS4_TP_BATCH_MAX_ROWS rows, so the block length is bounded by
+     * it (not by the rank count), and the payload exchange below handles any
+     * row count and any world size. */
+    g->tp_batch_rows = (g->tp_world >= 2 &&
                         g->tp_batch_out != NULL && g->tp_batch_in != NULL &&
                         n_tokens <= (uint32_t)DS4_TP_BATCH_MAX_ROWS)
                        ? n_tokens : 0;

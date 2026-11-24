@@ -1742,3 +1742,53 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     return cuda_ok(cudaGetLastError(),
                    "attention_output_low_q8 launch");
 }
+
+/* Rows form of the attention-output A projection for ROCm. The scalar HIP
+ * entry point above reduces exactly one row, so a chunk prefill (the V4.1
+ * layer-major sweep, or the N-rank TP attention-output batch) slices the
+ * heads/low views per row and reuses it. CUDA has a fused rows kernel; the
+ * per-row loop is the correct N-rank fallback and keeps every reduction
+ * shape identical to the single-token path. group0 only shifts the A slice
+ * and the head-group window, so any (group0, group_cnt) subset is valid. */
+extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+        ds4_gpu_tensor       *low,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups_total,
+        uint32_t              group0,
+        uint32_t              group_cnt,
+        const ds4_gpu_tensor *heads,
+        uint32_t              n_rows) {
+    if (!low || !heads || !model_map || group_dim == 0 || rank == 0 ||
+        n_groups_total == 0 || group_cnt == 0 ||
+        group0 > n_groups_total || group_cnt > n_groups_total - group0 ||
+        n_rows == 0) {
+        return 0;
+    }
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    const uint64_t row_a_bytes = blocks_a * 34u;
+    const uint64_t low_dim = (uint64_t)group_cnt * rank;
+    const uint64_t a_offset =
+        out_a_offset + (uint64_t)group0 * rank * row_a_bytes;
+    if (a_offset < out_a_offset || a_offset > model_size ||
+        heads->bytes < (uint64_t)n_rows * n_groups_total * group_dim *
+            sizeof(float) ||
+        low->bytes < (uint64_t)n_rows * low_dim * sizeof(float)) {
+        return 0;
+    }
+    for (uint32_t row = 0; row < n_rows; row++) {
+        ds4_gpu_tensor x = *heads, y = *low;
+        x.ptr = (char *)x.ptr +
+                ((uint64_t)row * n_groups_total + group0) * group_dim *
+                    sizeof(float);
+        x.bytes = (uint64_t)group_cnt * group_dim * sizeof(float);
+        y.ptr = (char *)y.ptr + (uint64_t)row * low_dim * sizeof(float);
+        y.bytes = low_dim * sizeof(float);
+        if (!ds4_gpu_attention_output_low_q8_tensor(&y, model_map, model_size,
+                a_offset, group_dim, rank, group_cnt, &x)) return 0;
+    }
+    return 1;
+}

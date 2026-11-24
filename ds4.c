@@ -43701,7 +43701,12 @@ static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
-    return g->tp_world == 1 || (g->tp_world == 2 &&
+    /* The bulk prefill protocol is N-rank: every gate above two ranks uses the
+     * chunk-sized ring exchange (ds41_sum_partial_batch -> the 0xB16 bulk
+     * frame), and the attention/MoE/HC batches index by tp_rank over
+     * tp_world. Nothing below is two-rank specific, so only the two-rank
+     * ablation envs remain meaningful. */
+    return g->tp_world == 1 || (g->tp_world >= 2 &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_ATTN") &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE") &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE") &&
@@ -43709,8 +43714,10 @@ static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
 }
 
 static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) {
-    /* TP batches use the bulk protocol; row-gate ablations stay token-major. */
-    if (!ds41_tp_batch_enabled(g) || g->imatrix ||
+    /* TP batches use the bulk protocol; row-gate ablations stay token-major.
+     * An image prompt keeps the verified per-token path: its spans are short
+     * and the vision-conditioned arithmetic has only been verified there. */
+    if (!ds41_tp_batch_enabled(g) || g->imatrix || g->image_count ||
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL")) return 1;
     uint32_t minimum = 256u;
 #ifdef __APPLE__

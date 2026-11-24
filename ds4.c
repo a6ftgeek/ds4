@@ -41714,9 +41714,18 @@ static bool ds41_hash_tokens(ds41_gpu_graph *g, ds4_engram_history *history,
 static bool ds41_embed(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                         ds4_gpu_tensor *out, ds4_gpu_tensor *scratch, int token, uint32_t pos) {
     const ds4_vision_span *image = ds41_image_at(g, pos);
+    static int image_dbg = -1;
+    if (image_dbg < 0) image_dbg = getenv("DS4_V41_IMAGE_DEBUG") != NULL;
+    if (image_dbg && (image || (g->image_count && pos >= g->images[0].token_start)))
+        fprintf(stderr, "ds4: V4.1 embed pos=%u images=%zu %s\n", pos,
+                g->image_count, image ? "IMAGE" : "text");
     if (!image) return ds4_gpu_embed_token_hc_tensor(out, m->map, m->size,
         w->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)token, DS4_N_EMBD, DS4_N_HC);
     const float *data = image->embedding.data + (uint64_t)(pos - image->token_start) * DS4_N_EMBD;
+    if (image_dbg)
+        fprintf(stderr, "ds4: V4.1 image row %u/%u emb[0..3]=%g %g %g %g\n",
+                pos - image->token_start, image->embedding.token_count,
+                data[0], data[1], data[2], data[3]);
     return ds4_gpu_tensor_write(scratch, 0, data, (uint64_t)DS4_N_EMBD * sizeof(float)) &&
         ds4_gpu_repeat_hc_tensor(out, scratch, DS4_N_EMBD, DS4_N_HC);
 }
@@ -76009,6 +76018,32 @@ static int ds4_engine_vision_encode_image(
     out->content_width = content_width;
     out->content_height = content_height;
     memcpy(out->fingerprint, image->fingerprint, sizeof(out->fingerprint));
+    if (getenv("DS4_VISION_ENCODER_STATS")) {
+        /* Rank-0 sanity for the projected visual rows: finite, non-degenerate
+         * and of the width the prefill expects. */
+        const uint64_t n = (uint64_t)token_count * DS4_N_EMBD;
+        double sum = 0.0;
+        float lo = INFINITY, hi = -INFINITY;
+        uint64_t bad = 0, zeros = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            const float v = embedding[i];
+            if (!isfinite(v)) { bad++; continue; }
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+            sum += (double)v;
+            if (v == 0.0f) zeros++;
+        }
+        fprintf(stderr,
+                "ds4: vision embedding rows=%u dim=%u elems=%llu min=%.6g "
+                "max=%.6g mean=%.6g nonfinite=%llu zeros=%llu "
+                "sample=[%.6g %.6g %.6g %.6g] grid=%ux%u content=%ux%u\n",
+                token_count, (unsigned)DS4_N_EMBD, (unsigned long long)n,
+                n && !bad ? lo : 0.0f, n && !bad ? hi : 0.0f,
+                n ? sum / (double)(n - bad) : 0.0,
+                (unsigned long long)bad, (unsigned long long)zeros,
+                embedding[0], embedding[1], embedding[2], embedding[3],
+                grid_width, grid_height, content_width, content_height);
+    }
     return 1;
 }
 
@@ -78990,7 +79025,12 @@ int ds4_session_sync_multimodal(
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
     }
-    if (image_count != 0 && !s->engine->vision_ready) {
+    /* Under tensor parallelism only the leader owns the vision weights. It
+     * materializes one float row per prompt position and ships the finished
+     * spans to the mirrors (DS4_TP_FRAME_SYNC_MULTIMODAL), so a worker must
+     * accept them without a local encoder. */
+    const bool tp_mirror_worker = s->engine->tp.active && s->engine->tp.rank != 0;
+    if (image_count != 0 && !s->engine->vision_ready && !tp_mirror_worker) {
         snprintf(err, errlen, "vision encoder is not loaded");
         return 1;
     }
@@ -79017,8 +79057,13 @@ int ds4_session_sync_multimodal(
                 return 1;
             }
         } else {
+            /* A mirror has no local image token id; the wire span still has to
+             * cover one run of identical placeholder tokens, which is the whole
+             * check the leader performs. */
+            const int placeholder = s->engine->vision_ready ?
+                s->engine->vision_image_token : prompt->v[span->token_start];
             for (uint64_t token = span->token_start; token < end; token++) {
-                if (prompt->v[token] != s->engine->vision_image_token) {
+                if (prompt->v[token] != placeholder) {
                     snprintf(err, errlen,
                              "image span does not cover image placeholder tokens");
                     return 1;

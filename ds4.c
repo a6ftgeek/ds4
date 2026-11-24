@@ -36166,7 +36166,10 @@ static bool metal_graph_eval_dspark_stage_chain(
     } else {
         g->tp_world = 0;
         g->tp_batch_rows = 0;
-        suspended_expert_sharding = saved_tp_world == 2;
+        /* A leader-local proposal needs the raw (unfiltered) expert tables on
+         * every rank count: at world>2 each rank owns a contiguous 1/N slice,
+         * so filtering to the owned window would drop drafter experts. */
+        suspended_expert_sharding = saved_tp_world >= 2;
         if (suspended_expert_sharding) {
             ds4_gpu_tp_suspend_expert_sharding(1);
         }
@@ -37467,7 +37470,7 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     const uint32_t saved_tp_batch_rows = g->tp_batch_rows;
     g->tp_world = 0;
     g->tp_batch_rows = 0;
-    const bool suspended_expert_sharding = saved_tp_world == 2;
+    const bool suspended_expert_sharding = saved_tp_world >= 2;
     if (suspended_expert_sharding) {
         ds4_gpu_tp_suspend_expert_sharding(1);
     }
@@ -84336,7 +84339,7 @@ static inline bool dspark_tp_block_matches(uint32_t flags, const int *drafts,
  * and one GPU per rank.  DS4_TP_DISABLE_VERIFY_HEAD_SPLIT turns it off. */
 static bool dspark_verify_head_split_wanted(ds4_session *s, int draft_n) {
     ds4_engine *e = s->engine;
-    return ds4_session_tp_leader(s) && e->tp.ctx &&
+    return ds4_session_tp_leader(s) && e->tp.ctx && e->tp.world == 2 &&
            ds4_tp_command_mailbox_active(e->tp.ctx) &&
            getenv("DS4_TP_DISABLE_VERIFY_HEAD_SPLIT") == NULL &&
            getenv("DS4_DSPARK_VERIFY_TOPS_CHECK") == NULL &&
@@ -85446,8 +85449,12 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
     return 1;
 #else
     ds4_engine *e = s ? s->engine : NULL;
-    if (!e || !e->tp.active || e->tp.rank != 1) {
-        snprintf(err, errlen, "tp: spec cycle outside worker mode");
+    /* Every non-leader rank mirrors the leader's verify block.  At world=2
+     * that is rank 1 alone; at N ranks it is ranks 1..N-1.  Rank 0 owns the
+     * block, the acceptance decision and the commit/broadcast frames. */
+    if (!e || !e->tp.active || e->tp.rank <= 0) {
+        snprintf(err, errlen, "tp: spec cycle outside worker mode (rank %d)",
+                 e && e->tp.active ? e->tp.rank : -1);
         return 1;
     }
     if (draft_n <= 0 || draft_n > DS4_DSPARK_MAX_BLOCK_SIZE) {
@@ -85659,7 +85666,8 @@ int ds4_session_tp_dspark_draft(ds4_session *s, int token, int pos,
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s && ds4_session_is_ds41(s)) {
         ds4_engine *e = s->engine;
-        if (e->tp.active && e->tp.rank == 1 && e->tp.vocab_split &&
+        if (e->tp.active && e->tp.rank != 0 &&
+            (e->tp.vocab_split ? e->tp.rank == 1 : true) &&
             mode == DS4_TP_DSPARK_DRAFT && pos > 0 &&
             s->checkpoint_valid && pos == s->checkpoint.len &&
             (uint32_t)pos == s->ds41_graph.pos && ds41_session_draft(s, token)) return 0;
@@ -85670,7 +85678,7 @@ int ds4_session_tp_dspark_draft(ds4_session *s, int token, int pos,
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && \
     defined(DS4_HAS_DEEPSEEK41_GPU)
     ds4_engine *e = s ? s->engine : NULL;
-    if (!e || !e->tp.active || e->tp.rank != 1 || !e->tp.dspark_split || pos <= 0) {
+    if (!e || !e->tp.active || e->tp.rank <= 0 || !e->tp.dspark_split || pos <= 0) {
         snprintf(err, errlen, "tp: DSpark draft frame without an agreed lockstep drafter");
         return 1;
     }

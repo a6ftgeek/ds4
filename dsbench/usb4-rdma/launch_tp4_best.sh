@@ -19,14 +19,25 @@
 #   checkpoint is rejected at ds4.c:74106 ("--vision requires ... the pinned
 #   DeepSeek V4 Flash Vision-Exp or V4.1 Flash model"), and V4.1 vision itself
 #   is Metal-only (ds4.c:74034). The 0731 weights carry no vision projection.
-# DSpark: OFF. Matching 0731 drafter weights exist and run on ROCm single-host,
-#   but the mirrored speculative-verify worker path is rank-1-only (ds4.c:85410)
-#   and the lockstep drafter split is compiled out on ROCm (ds4.c:75261,
-#   ds4.c:80511); ranks 2 and 3 abort at the first spec cycle. Do not add
-#   --dspark to a 4-rank launch until that path is generalized.
+# DSpark: OFF by default (DSPARK=1 turns it on). The N-rank verify path works:
+#   every worker rank mirrors the leader's block, and at world=4 the generated
+#   text is byte-identical to the non-speculative run on both the coding and
+#   the prose prompt (64 tokens). It is not a bottleneck win yet -- the world=4
+#   verifier has no batched gate path (tp_batch_rows is world=2 only), so a
+#   verify block costs ~870 ms/cycle against a 109 ms decode token:
+#     TP=4 coding  9.15 -> 4.00 t/s (-56.3%, accept 80.95%)
+#     TP=4 prose   9.23 -> 4.18 t/s (-54.7%, accept 96.00%)
+#     TP=4 prose with DS4_DSPARK_SEED_BATCH=0: 6.51 t/s (-29.5%)
+#   TP=2 coding is the one net win (10.04 -> 14.53 t/s, +44.7%, accept 92.50%).
+#   The canonical 16-token greedy md5 (a13ba035...) matches with
+#   DS4_DSPARK_SEED_BATCH=0 only; the default fused seed batch keeps the
+#   batched-verifier floating-point order and flips one near-tie word, as
+#   docs/SPECULATIVE_DECODING.md already warns. Numbers and the audit are in
+#   dsbench/usb4-rdma/FEATURE_STATUS.md.
 #
 # usage: bash launch_tp4_best.sh [prompt-file] [n_tokens]
-# env:   CTX (default 1048576), TP_CORE (2), PORT (19730), TIMEOUT (3600)
+# env:   CTX (default 1048576), TP_CORE (2), PORT (19730), TIMEOUT (3600),
+#        DSPARK (0)
 #
 # rank 0 = node1 (coordinator, started last). Ranks 1-3 = node2-4.
 # --tp-cpu-core is mandatory: unpinned busy-poll ring threads lose ~40% decode.
@@ -40,6 +51,12 @@ CTX=${CTX:-1048576}
 TP_CORE=${TP_CORE:-2}
 PORT=${PORT:-19730}
 TIMEOUT=${TIMEOUT:-3600}
+# Speculative decode is opt-in while its net effect is measured: DSPARK=1 adds
+# --dspark and the 0731 support drafter plus DS4_DSPARK_STATS=1 so the leader
+# prints cycles/proposed/accepted/accept_rate. The default stays the verified
+# non-speculative configuration.
+DSPARK=${DSPARK:-0}
+DSPARK_MODEL=${DSPARK_MODEL:-gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf}
 
 M='gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf'
 IPS=(192.168.1.101 192.168.1.102 192.168.1.103 192.168.1.104)
@@ -55,6 +72,11 @@ for ip in "${IPS[@]}"; do ring+=(--tp-ring-ip "$ip"); done
 common=(-m "$M" -c "$CTX" --temp 0 -n "$NTOK" --prompt-file "$PROMPT" --rocm
         --tensor-parallel --transport usb4-rdma --tp-world-size 4
         "${ring[@]}" --tp-cpu-core "$TP_CORE")
+if [ "$DSPARK" = 1 ]; then
+    common+=(--dspark --mtp-model "$DSPARK_MODEL")
+fi
+DS4_ENV="USB4_RING_QP_TIMEOUT=14"
+[ "$DSPARK" = 1 ] && DS4_ENV="$DS4_ENV DS4_DSPARK_STATS=1"
 
 cleanup() {
     for ((r=1; r<4; r++)); do
@@ -70,15 +92,15 @@ cleanup; sleep 1
 for ((r=1; r<4; r++)); do
     h=${HOSTS[$r]}
     ssh -o BatchMode=yes "$h" \
-        "cd \$HOME/dev/ds4-v41-pp/src && exec env USB4_RING_QP_TIMEOUT=14 toolbox run -c vllm-gfx1151 -- ./ds4 ${common[*]} --role worker --tp-rank $r --coordinator ${IPS[0]} $PORT" \
+        "cd \$HOME/dev/ds4-v41-pp/src && exec toolbox run -c vllm-gfx1151 -- env $DS4_ENV ./ds4 ${common[*]} --role worker --tp-rank $r --coordinator ${IPS[0]} $PORT" \
         > "/tmp/${TAG}_r${r}.log" 2>&1 &
     echo "started rank $r on $h"
 done
 sleep 6
 
 cd "$REPO" || exit 1
-timeout "$TIMEOUT" env USB4_RING_QP_TIMEOUT=14 \
-    toolbox run -c vllm-gfx1151 -- ./ds4 "${common[@]}" \
+timeout "$TIMEOUT" toolbox run -c vllm-gfx1151 -- env $DS4_ENV \
+    ./ds4 "${common[@]}" \
     --role coordinator --listen 0.0.0.0 "$PORT" \
     > "/tmp/${TAG}_r0.log" 2>&1
 rc=$?

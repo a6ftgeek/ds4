@@ -75862,7 +75862,9 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
     return e && e->tp.active && e->tp.vocab_split;
 }
 
-#if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(DS4_ROCM_BUILD)
+/* The gate callbacks only touch the transport seam (ds4_tp_*) and the slab
+ * tensor's host address, so ROCm uses the same bodies as CUDA. */
+#if defined(DS4_HAS_DEEPSEEK41_GPU)
 static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_engine *e = ud;
     ds4_tp *tp = e->tp.ctx;
@@ -75920,7 +75922,7 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
 #endif
 
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
-#if !defined(DS4_HAS_DEEPSEEK41_GPU) || defined(DS4_ROCM_BUILD)
+#if !defined(DS4_HAS_DEEPSEEK41_GPU)
     (void)e; (void)tp;
     snprintf(err, errlen, "tensor parallelism requires Metal or CUDA");
     return 0;
@@ -75952,10 +75954,9 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
     e->tp.ctx = tp;
-    bool shared_cuda_slab = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     e->tp.slab = ds4_gpu_tp_slab_alloc(slab_bytes);
-    shared_cuda_slab = e->tp.slab != NULL;
+    const bool shared_cuda_slab = e->tp.slab != NULL;
 #endif
     if (!e->tp.slab) e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
     e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);
@@ -75974,7 +75975,17 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         goto fail;
     }
     void *network_slab;
-    if (e->backend == DS4_BACKEND_CUDA && !shared_cuda_slab) {
+#if defined(DS4_ROCM_BUILD)
+    /* gfx1151 is a unified-memory APU: the slab tensor's device pointer is
+     * already host-addressable, which is exactly what the transport needs.  A
+     * separate calloc() staging buffer would put the transport bytes in a
+     * different allocation from the out_views/in_views that the graph writes,
+     * so the exchange would carry stale data.  Use the tensor directly. */
+    const bool host_staged_slab = false;
+#else
+    const bool host_staged_slab = e->backend == DS4_BACKEND_CUDA && !shared_cuda_slab;
+#endif
+    if (host_staged_slab) {
         e->tp.host_slab = calloc(1, (size_t)slab_bytes);
         network_slab = e->tp.host_slab;
     } else {

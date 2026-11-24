@@ -35,8 +35,7 @@ ROCM_UNAVAILABLE_INT(ds4_gpu_shared_down_hc_expand_add_q8_0_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor)
 
+/* ds4_gpu_tp_init / ds4_gpu_tp_shutdown / ds4_gpu_tp_failed now live with the
+ * real gate service in ds4_rocm.cu. */
 extern "C" uint64_t ds4_gpu_tp_big_gate_kick(...) { return 0; }
 ROCM_UNAVAILABLE_INT(ds4_gpu_tp_big_gate_wait)
-ROCM_UNAVAILABLE_INT(ds4_gpu_tp_init)
-extern "C" void ds4_gpu_tp_shutdown(void) {}
-extern "C" int ds4_gpu_tp_failed(void) { return 1; }

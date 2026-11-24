@@ -176,16 +176,91 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 #include "rocm/ds4_rocm_deepseek4_vision.cuh"
 #include "ds4_deepseek41_cuda.cuh"
 
-/* Tensor-parallel gates are Metal-only; stubs keep shared graph code
- * linkable (TP option validation rejects non-Metal backends). */
+/* Network tensor parallelism: the gate service.  This mirrors the CUDA
+ * implementation in ds4_cuda.cu; ROCm orders every launch on the default
+ * stream, so a device synchronize is the equivalent arrival barrier before the
+ * host hands a gate slot to the transport. */
+static struct {
+    ds4_gpu_tp_exchange_fn row;
+    ds4_gpu_tp_batch_exchange_fn batch;
+    ds4_gpu_tp_big_exchange_fn big;
+    void *ud, *staging;
+    uint64_t vec_bytes, staging_bytes, row_seq, batch_seq;
+    bool failed;
+} g_rocm_tp;
+
+extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
+        uint64_t gpu_flags_off, uint64_t out_off, uint64_t vec_bytes,
+        ds4_gpu_tp_exchange_fn fn, void *ud) {
+    if (g_rocm_tp.row || rank > 1 || !slab || !fn || !vec_bytes ||
+        out_off > slab->bytes || vec_bytes > slab->bytes - out_off ||
+        gpu_flags_off >= slab->bytes) return 0;
+    g_rocm_tp.row = fn;
+    g_rocm_tp.ud = ud;
+    g_rocm_tp.vec_bytes = vec_bytes;
+    return 1;
+}
+
+extern "C" void ds4_gpu_tp_shutdown(void) {
+    if (g_rocm_tp.row) (void)cudaDeviceSynchronize();
+    if (g_rocm_tp.staging) (void)cudaFreeHost(g_rocm_tp.staging);
+    g_rocm_tp = {};
+}
+
+extern "C" int ds4_gpu_tp_failed(void) { return g_rocm_tp.failed ? 1 : 0; }
+
 extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
-    (void)layer; (void)gate;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
+    if (!g_rocm_tp.row || g_rocm_tp.failed) return 0;
+    /* Do not leave the graph running ahead of a remote process. */
+    const int ok = cuda_ok(cudaDeviceSynchronize(), "TP row arrival") &&
+        g_rocm_tp.row(g_rocm_tp.ud, layer, gate, ++g_rocm_tp.row_seq);
+    if (!ok) g_rocm_tp.failed = true;
+    return ok;
 }
 
 extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
-    (void)fn;
+    g_rocm_tp.batch = fn;
+}
+
+extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
+    g_rocm_tp.big = fn;
+}
+
+extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+    if (!g_rocm_tp.row || !g_rocm_tp.batch || g_rocm_tp.failed ||
+        !rows || rows > 8) return 0;
+    const int ok = cuda_ok(cudaDeviceSynchronize(), "TP batch arrival") &&
+        g_rocm_tp.batch(g_rocm_tp.ud, layer, rows, ++g_rocm_tp.batch_seq);
+    if (!ok) g_rocm_tp.failed = true;
+    return ok;
+}
+
+extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
+        const ds4_gpu_tensor *out_t, ds4_gpu_tensor *in_t, uint64_t bytes) {
+    if (!g_rocm_tp.row || !g_rocm_tp.big || g_rocm_tp.failed ||
+        !out_t || !in_t || !rows ||
+        bytes != (uint64_t)rows * g_rocm_tp.vec_bytes ||
+        bytes > SIZE_MAX / 2 || bytes > out_t->bytes ||
+        bytes > in_t->bytes) return 0;
+    if (bytes > g_rocm_tp.staging_bytes) {
+        if (g_rocm_tp.staging) (void)cudaFreeHost(g_rocm_tp.staging);
+        g_rocm_tp.staging = NULL;
+        g_rocm_tp.staging_bytes = 0;
+        if (!cuda_ok(cudaMallocHost(&g_rocm_tp.staging, (size_t)bytes * 2),
+                     "TP bulk staging")) {
+            g_rocm_tp.failed = true;
+            return 0;
+        }
+        g_rocm_tp.staging_bytes = bytes;
+    }
+    void *peer = (char *)g_rocm_tp.staging + g_rocm_tp.staging_bytes;
+    const int ok = cuda_ok(cudaDeviceSynchronize(), "TP bulk arrival") &&
+        ds4_gpu_tensor_read(out_t, 0, g_rocm_tp.staging, bytes) &&
+        g_rocm_tp.big(g_rocm_tp.ud, layer, ++g_rocm_tp.batch_seq,
+                      g_rocm_tp.staging, peer, bytes) &&
+        ds4_gpu_tensor_write(in_t, 0, peer, bytes);
+    if (!ok) g_rocm_tp.failed = true;
+    return ok;
 }
 
 extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
@@ -202,24 +277,6 @@ extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
 
 extern "C" void ds4_gpu_model_residency_skip(int skip) {
     (void)skip;
-}
-
-extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
-    (void)fn;
-}
-
-extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
-                                          const ds4_gpu_tensor *out_t,
-                                          ds4_gpu_tensor *in_t,
-                                          uint64_t bytes) {
-    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
-    return 0;
-}
-
-extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
-    (void)layer; (void)rows;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
-    return 0;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(

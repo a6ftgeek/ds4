@@ -776,7 +776,9 @@ int ds4_tp_validate_engine_options(
         return 0;
     }
     bool supported_backend = opt->backend == DS4_BACKEND_METAL;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#if !defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* ROCm presents DS4_BACKEND_CUDA (see ds4_backend_uses_graph in ds4.c), so
+     * the HIP build must accept the same value as the CUDA build. */
     supported_backend |= opt->backend == DS4_BACKEND_CUDA;
 #endif
     if (!supported_backend) {
@@ -787,6 +789,25 @@ int ds4_tp_validate_engine_options(
         tp_set_err(err, errlen, "network CUDA TP requires one GPU per rank and resident expert shards");
         return 0;
     }
+#if defined(DS4_ROCM_BUILD)
+    /* The ROCm build has the whole collective seam -- ring transports, the
+     * gate service (ds4_rocm.cu), the unified-memory slab, and the 50/50
+     * sharded model span loader -- but not the compute half of the expert
+     * split.  Expert ownership is implemented inside ds4_cuda.cu's routed-MoE
+     * entry points: g_network_tp_rank filters the router selection to the
+     * owned experts, rebases the expert-table offsets and halves
+     * n_total_expert (ds4_cuda.cu:26108-26137), and the two builders that
+     * materialise a rank's expert half, ds4_gpu_build_derived_artifacts_shard
+     * and ds4_gpu_build_mxfp4_tp_split, exist only in ds4_cuda.cu.  Without
+     * them a ROCm rank evaluates every selected expert through the lazily
+     * mapped model image and both ranks then add their full routed partial.
+     * Refuse rather than run a wrong split. */
+    tp_set_err(err, errlen,
+               "tp: ROCm has the collective seam but not the 2-rank expert-split "
+               "compute: the owned-expert routed-MoE path and the "
+               "derived-artifact/MXFP4 split builders are CUDA-only");
+    return 0;
+#endif
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
         tp_set_err(err, errlen, "tensor parallelism and --role distributed modes are exclusive");
         return 0;

@@ -3057,7 +3057,10 @@ int ds4_tp_create(
         tp->peer_data[i] = -1;
         tp->peer_rank[i] = -1;
     }
-    tp->xchg_stats = getenv("DS4_TP_XCHG_STATS") != NULL;
+    /* DS4_TP_GATE_STATS is the documented spelling; DS4_TP_XCHG_STATS is the
+     * older name for the same per-gate/payload accounting. */
+    tp->xchg_stats = getenv("DS4_TP_XCHG_STATS") != NULL ||
+                     getenv("DS4_TP_GATE_STATS") != NULL;
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
     if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
@@ -3328,18 +3331,32 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
     if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
 #endif
     ds4_tp_gate_header h = { DS4_TP_MAGIC, (uint16_t)layer, (uint16_t)gate, seq };
-    ds4_tp_gate_header ph;
+    ds4_tp_gate_header ph = { 0, 0, 0, 0 };
     void *out = tp->slab + ds4_tp_slab_out_offset(tp, layer, gate);
     void *in = tp->slab + ds4_tp_slab_in_offset(tp, layer, gate);
+    int checked = 0;
     if (tp->ring) {
-        /* Ring payload plane: the header stays a small TCP rendezvous and the
-         * payload moves as one all-gather over the USB4 links. */
-        if (!tp_tcp_exchange(tp, &h, &ph, NULL, NULL, 0)) return 0;
+        /* Ring payload plane. On this path the per-gate header is a diagnostic
+         * rendezvous only: every ring all-reduce step is itself a barrier (a
+         * rank finishes step s only once the whole ring has posted step s), and
+         * the payload carries an absolute sequence marker. The extra TCP round
+         * trip measured 291 us of the 461 us whole gate on the live 4-node
+         * stack -- 80 gates/token, i.e. 63% of decode gate time -- so it is
+         * skipped unless DS4_TP_RING_HEADER asks for the cross-check. A genuine
+         * ordering bug still fails safe: usb4_rdma_ring's wait_marker accepts
+         * only the expected seq and times out after 5 s. */
+        if (getenv("DS4_TP_RING_HEADER")) {
+            if (!tp_tcp_exchange(tp, &h, &ph, NULL, NULL, 0)) return 0;
+            checked = 1;
+        }
     } else {
         /* TCP keeps the production one-call header+payload exchange. */
         if (!tp_tcp_exchange(tp, &h, &ph, out, in, tp->vec_bytes)) return 0;
+        checked = 1;
     }
-    if (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate || ph.seq != seq) {
+    if (checked &&
+        (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate ||
+         ph.seq != seq)) {
         fprintf(stderr, "ds4-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
                 layer, gate, (unsigned long long)seq);

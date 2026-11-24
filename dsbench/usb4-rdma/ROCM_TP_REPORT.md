@@ -315,66 +315,69 @@ earlier in this document are historical only.
 
 ## Operations
 
-Inter-node SSH is broken (`Permission denied (publickey)`), so always fan out from the
-Windows host with `ssh nodeN`. Write scripts locally, `scp` them, and run
-`bash /tmp/script.sh`. `sudo` is passwordless on node1 (used only for read-only inspection here).
+Inter-node SSH **works** as of 2026-11-24: node1 (`node_one`) has a passwordless
+ed25519 key in `authorized_keys` on node2/3/4, and `~/.ssh/config` maps
+`node2 -> node_two@192.168.1.102`, `node3 -> node_three@192.168.1.103`,
+`node4 -> node_four@192.168.1.104`. Verified from node1:
+`for h in node2 node3 node4; do ssh -o BatchMode=yes $h 'id -un; hostname'; done`
+returns rc=0 with the right username on each. `sudo` is passwordless on node1.
 
 ### API endpoint
 
 - Local (on node1): **`http://127.0.0.1:8000/v1`** -- OpenAI-compatible
   (`/v1/models`, `/v1/chat/completions`), served model id `deepseek-v4.1-flash`,
-  `context_length: 1048576`, `max_completion_tokens: 256`.
-- LAN: **not reachable as configured.** `ds4-server` is started with `--host 127.0.0.1`
-  and listens on `127.0.0.1:8000` only. See "LAN exposure and services" below.
+  `context_length: 1048576`, `max_completion_tokens: 256`, `--vision` on.
+- LAN: **`http://192.168.1.101:8000/v1`** -- `ds4-server` now binds `0.0.0.0:8000`
+  and `8000/tcp` is open permanently in the `FedoraServer` firewalld zone.
+  Verified with `curl` from the Windows host (HTTP 200).
 
-### LAN exposure and services (read-only findings, 2026-11-24)
+### LAN exposure and services (updated 2026-11-24)
 
-- `ds4-server` listens on `127.0.0.1:8000` only (`--host 127.0.0.1`), so the API is
-  **not reachable from another machine** today. The LAN URL would be
-  `http://192.168.1.101:8000/v1` if it were started with `--host 0.0.0.0` (or
-  `--host 192.168.1.101`).
-- `firewalld` is running; default zone `FedoraServer` (interfaces `enp191s0`, `tbv0`)
-  allows services `cockpit dhcpv6-client ssh`. **Port 8000/tcp is not open.** Exposing
-  the API would need `firewall-cmd --add-port=8000/tcp` (not done).
+- `ds4-server` binds **`0.0.0.0:8000`** (`--host 0.0.0.0 --port 8000`); `ss -ltnp`
+  shows `0.0.0.0:8000` on node1. The LAN URL is **http://192.168.1.101:8000/v1**.
+- `firewalld` is running; default zone `FedoraServer` (interfaces `tbv0`, `enp191s0`).
+  **Port `8000/tcp` is open permanently** (`firewall-cmd --permanent --add-port=8000/tcp
+  && firewall-cmd --reload`; `firewall-cmd --query-port=8000/tcp` -> `yes`).
 - Cockpit is installed (`cockpit-368-1.fc45`); `cockpit.socket` is enabled and active on
   `*:9090`, and the `cockpit` service is allowed through the firewall, so
   **https://192.168.1.101:9090** is reachable from the LAN.
-- No "Halostrix"/AI-cockpit **service registry** exists on node1: no systemd unit, no
-  registry directory under `/etc` or `~/dev`. The only AI-cockpit artifact is the
-  pipx-installed `ai-toolbox-cockpit` TUI (v2026.11.22.1536) with
-  `~/.config/ai-toolbox-cockpit/config.json` = `{"active_platform": "strix-halo"}`.
+- The service is **`ds4-tp4.service`** (see the update section), visible in Cockpit
+  **Services** at <https://192.168.1.101:9090>; the unit's journal carries the engine
+  output through `systemd-cat`.
 
-### Start (coordinator first, then the three workers)
-
-```bash
-# node1 -- coordinator, rank 0 (keeps /tmp/start_coord.sh intact)
-ssh -o BatchMode=yes node1 'CTX=1048576 VISION=1 nohup bash /tmp/start_coord.sh >/tmp/srv_final.log 2>&1 &'
-
-# node2 -- worker rank 1
-ssh -o BatchMode=yes node2 'nohup bash /tmp/start_worker.sh 1 >/tmp/srv_r1.log 2>&1 &'
-
-# node3 -- worker rank 2
-ssh -o BatchMode=yes node3 'nohup bash /tmp/start_worker.sh 2 >/tmp/srv_r2.log 2>&1 &'
-
-# node4 -- worker rank 3
-ssh -o BatchMode=yes node4 'nohup bash /tmp/start_worker.sh 3 >/tmp/srv_r3.log 2>&1 &'
-```
-
-`/tmp/start_coord.sh` and `/tmp/start_worker.sh` must be preserved -- the server cannot be
-relaunched without them. Both are plain `toolbox run -c vllm-gfx1151 -- ./ds4-server|./ds4`
-wrappers over `$HOME/dev/ds4-v41-pp/src`; env knobs are `CTX`, `VISION=1`, `EXTRA`,
-`ENVV`.
-
-### Stop (SIGTERM; workers first, then the coordinator)
+### Start / stop / status (systemd; manual fallback below)
 
 ```bash
-ssh -o BatchMode=yes node2 'pkill -TERM -f "role worker"'
-ssh -o BatchMode=yes node3 'pkill -TERM -f "role worker"'
-ssh -o BatchMode=yes node4 'pkill -TERM -f "role worker"'
-ssh -o BatchMode=yes node1 'pkill -TERM -f "role coordinator"'
+# start all four ranks; the API answers when the engine is loaded (~40-90 s)
+ssh -o BatchMode=yes node1 'sudo systemctl start ds4-tp4.service'
+
+# stop coordinator then workers (exact process names)
+ssh -o BatchMode=yes node1 'sudo systemctl stop ds4-tp4.service'
+
+# restart; verified to leave 0 orphaned processes
+ssh -o BatchMode=yes node1 'sudo systemctl restart ds4-tp4.service'
+
+# unit health + journal
+ssh -o BatchMode=yes node1 'systemctl status ds4-tp4.service --no-pager'
+ssh -o BatchMode=yes node1 'journalctl -u ds4-tp4.service -n 50 --no-pager'
 ```
 
-This was **not** executed during the handoff: the 4-node server must stay running.
+The launcher is `dsbench/usb4-rdma/launch_tp4_best.sh` (`start|stop|status|restart`);
+it fans out to node2-4 over the passwordless ssh above. The unit runs as `node_one`
+because rootless `toolbox`/podman live in that user's storage; `loginctl enable-linger
+node_one` keeps `/run/user/1000` available without a login. The manual wrappers
+`/tmp/start_coord.sh` and `/tmp/start_worker.sh` are preserved as a fallback, and the
+old CLI benchmark launcher is kept as `launch_tp4_cli_bench.sh`.
+
+### Stop (manual fallback)
+
+```bash
+# coordinator first, then the three workers; exact names only
+ssh -o BatchMode=yes node1 'pkill -TERM -x ds4-server'
+for h in node2 node3 node4; do ssh -o BatchMode=yes $h 'pkill -TERM -x ds4'; done
+```
+
+Under systemd use `systemctl stop ds4-tp4.service` instead.
 
 ### Status
 
@@ -473,3 +476,179 @@ b3f5018 Read half-aligned Qwen Q2 weight rows correctly on Metal
   empty; `feat/rocm-tp-ring` `49d6ce9` and `feat/usb4-rdma-ring` `e26ee49` unchanged.
 - Launchers `/tmp/start_coord.sh` and `/tmp/start_worker.sh` preserved on all nodes.
 - Q2 GGUF deleted on node2/3/4 (~81 GiB freed each); Q4 + vision + 0731 drafter remain.
+
+
+# UPDATE — gate audit, LAN API and `ds4-tp4.service` (2026-11-24)
+
+## Step 1 — the two per-layer ring gates
+
+### What the two exchanges are
+
+V4.1 has `DS4_N_LAYER = 40` and two gates per layer (`DS4_TP_GATES_PER_LAYER = 2`,
+`ds4_tp.h:30-32`: `DS4_TP_GATE_ATTN = 0`, `DS4_TP_GATE_FFN = 1`). Both fire from the
+decode graph and reach the same seam, `ds4_tp_gate_exchange()` (`ds4_tp.c:3321`). At
+world=4 over `--transport usb4-rdma` each gate moves **5120 x f32 = 20,480 B** per rank
+(`tp_ring_exchange`, `ds4_tp.c:556` -> `ds4_tp_ring_all_reduce` ->
+`usb4_rdma_ring_all_reduce`, `misc/usb4/usb4_rdma_ring.c:1312`).
+
+| gate | id | fired at | reduces | dtype / rows |
+|---|---|---|---|---|
+| attention output | `DS4_TP_GATE_ATTN` (0) | `ds4.c:42115` in `ds41_attention_expand()`, reached from `ds41_attention()` (`ds4.c:42365`) | this rank's `attn_output_b` group slice: a partial sum of the layer's attention output | F32, 1 row x 5120 |
+| MoE / FFN output | `DS4_TP_GATE_FFN` (1) | `ds4.c:42699` in `ds41_moe_finish()`, reached from `ds41_moe()` (`ds4.c:42706`) -> `ds41_graph_layer()` (`ds4.c:43332`) | this rank's routed/shared expert partial | F32, 1 row x 5120 |
+
+(The two `ds41_sum_partial(..., DS4_TP_GATE_ATTN)` sites at `ds4.c:42378` and
+`ds4.c:43374` are the world=2 decode-island path; at world=4 the
+`ds41_attention_expand` site above is the one that runs.)
+
+### Data dependency: strictly serial
+
+`ds41_attention_expand` (`ds4.c:42103-42118`) reduces the ATTN partials into `g->block`
+and then `ds41_hc_expand`s it. `ds41_graph_before_moe` (`ds4.c:42953`) calls that before
+`ds41_moe`. `ds41_hc_mix` (`ds4.c:42032`) computes
+`g->x = ds41_hc_sum(residual, pre, ffn)` and `g->norm = ds41_norm(g->x)`, and
+`ds41_moe_partial` (`ds4.c:42690`) computes the router row with
+`ds41_matmul(g->route_logits, ffn_gate_inp, g->norm)`. The MoE gate/router therefore
+consumes the **reduced** attention output: the FFN all-reduce cannot start until the
+attention all-reduce has finished. All 80 exchanges per token form one serial chain
+(layer L+1's attention also depends on layer L's FFN residual), so there is no
+independent pair to fuse or overlap either. Fusing the two collectives would require
+routing on an unreduced hidden state or sending an incomplete attention partial — both
+change model math. **Not fuseable; not attempted.**
+
+### Cheaper wins that do not touch model math
+
+1. **Per-gate TCP header (implemented, `f2a3863`).** At world>2 the ring path still sent
+   a 16-byte layer/gate/seq header to every peer over TCP and waited for the replies
+   (`tp_tcp_exchange_multi`, `ds4_tp.c:860`) before the ring all-reduce. The ring already
+   barriers at every step and its payload carries an absolute seq marker, so the header
+   was diagnostic, not a correctness requirement. Measured on the live stack: **199 us of
+   a 491.7 us whole gate through the API (40.5%)**, 291 us of 461 us on the CLI.
+   `f2a3863` skips it on the ring decode path (`DS4_TP_RING_HEADER=1` restores the
+   cross-check); the TCP gate path and the prefill big-gate arrival barrier are
+   unchanged. An ordering bug still fails safe: `wait_marker` accepts only the expected
+   seq and times out after 5 s.
+2. **Overlap instead of fuse (rejected).** There is no consumer that can run between the
+   ATTN reduce and the FFN reduce: the router is that consumer, and the 80 gates are a
+   serial chain.
+3. **Software-HCA wake-up / polling.** The ring busy-polls its completion marker with
+   `cpu_pause()` and a 5 s deadline (`misc/usb4/usb4_rdma_ring.c:775`). The QP ACK
+   timeout is tunable with `USB4_RING_QP_TIMEOUT` (`misc/usb4/usb4_rdma_ring.c:73`): the
+   library default is 8 (1.05 ms), the launcher pins 14 (67 ms) to survive the one cold
+   prefill gap. In the 5040-gate CLI sample only 4 steps exceeded 1 ms (max 41 ms, i.e.
+   one wake-up); decode gates are back-to-back, so the ms-scale idle gap that causes the
+   stall is absent. A full 8-vs-14 A/B was not run in this session; lowering the timeout
+   trades the cold-gate retry margin for a shorter worst-case stall and is the first knob
+   to try if the stall returns.
+
+### Measured result (same prompts, ctx 1048576, greedy)
+
+| metric | before | after |
+|---|---:|---:|
+| gate whole / payload (API) | 491.7 / 292.7 us | 360.6 / 360.6 us |
+| gate whole / payload (CLI) | 461.2 / 170.2 us | -- |
+| 99-token decode | 8.88 t/s | 10.35-11.60 t/s (avg 10.98, +23.6%) |
+| 99-token TTFT | 8.74 s | 6.87-7.43 s |
+| 36-token TTFT | 3.38 s | 2.63 s (1 run) |
+| 390-token decode | 4.29/4.49 t/s | 4.27/4.55 t/s (unchanged) |
+| 390-token prefill | 78.5 t/s | 77.6-79.8 t/s (unchanged) |
+
+The 390-token decode is attention/indexer-compute-bound, so the ~16 ms/token removed
+from 80 gates is inside run-to-run noise there; the short/mid path (<256-token prompts
+run the token-major gates) is where it shows. Prefill >=256 tokens keeps the big-gate
+arrival header and is unchanged.
+
+Gate count: `DS4_TP_GATE_STATS=1` (now an alias of `DS4_TP_XCHG_STATS`) prints
+`n=118240` = 80 x 1478 token positions (740 decoded + 738 prefilled on the token-major
+short path) = **80 exchanges per position exactly** — the count is unchanged, as
+expected: this is a latency cut, not a fusion.
+
+Vision re-verified on the same 560x560 PNG (md5 `c18f122eb25273583aa5f197f6532439`):
+*"A red circle and a blue square above the text "CAT 347" (with "CAT" in black and "347"
+in green)."* HTTP 200, 29.7 s, `finish=stop`.
+
+## Step 2 — LAN API and `ds4-tp4.service`
+
+### Bind and firewall
+
+`ds4-server` now starts with `--host 0.0.0.0 --port 8000` (launcher default;
+`CTX=1048576`, `--vision` on). `ss -ltnp` on node1:
+
+```
+LISTEN 0 128 0.0.0.0:8000 0.0.0.0:* users:(("ds4-server",pid=...,fd=28))
+```
+
+`firewall-cmd --permanent --add-port=8000/tcp && firewall-cmd --reload`;
+`firewall-cmd --query-port=8000/tcp` -> **yes** (zone `FedoraServer`, interfaces
+`tbv0 enp191s0`).
+
+### Inter-node SSH (the constraint that decided the unit design)
+
+The unit can only restart all four ranks if node1 can reach node2-4. That is **working**:
+node1 (`node_one`) has an ed25519 key trusted in `authorized_keys` on each worker, and
+`~/.ssh/config` maps the per-node usernames. Evidence from node1:
+
+```
+$ for h in node2 node3 node4; do ssh -o BatchMode=yes $h 'id -un; hostname'; done
+node_two
+node2
+node_three
+node3
+node_four
+node4
+```
+
+rc=0 on all three, no password prompt, no `enp191s0` change, no new install. The unit
+therefore manages the **full four-rank cluster**, not just the coordinator.
+
+### Unit
+
+`dsbench/usb4-rdma/ds4-tp4.service` (installed at `/etc/systemd/system/ds4-tp4.service`)
+runs as `node_one` (rootless `toolbox`/podman live in that user's storage;
+`loginctl enable-linger node_one` keeps `/run/user/1000` present), with
+`Restart=on-failure`, `KillMode=mixed` and journald output:
+
+```
+[Service]
+User=node_one
+Environment=HOME=/home/node_one
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=CTX=1048576
+Environment=BIND=0.0.0.0
+Environment=PORT=8000
+Environment=VISION=1
+ExecStart=/usr/bin/bash /home/node_one/dev/ds4-v41-pp/src/dsbench/usb4-rdma/launch_tp4_best.sh start
+ExecStop=/usr/bin/bash /home/node_one/dev/ds4-v41-pp/src/dsbench/usb4-rdma/launch_tp4_best.sh stop
+Restart=on-failure
+```
+
+The engine runs inside the container, so the launcher pipes the coordinator through
+`systemd-cat -t ds4-tp4`; without that, journald attributes the engine to the container
+scope and Cockpit's unit log only shows the launcher. `ExecStart` fans out to node2-4
+and then waits for `/v1/models`; `ExecStop` SIGTERMs `ds4-server` on node1 then `ds4` on
+node2-4 (exact process names only).
+
+Cockpit: <https://192.168.1.101:9090> -> **Services** -> `ds4-tp4.service`
+(Logs tab = `journalctl -u ds4-tp4.service`).
+
+### Verified
+
+- `systemctl status ds4-tp4.service` -> `active (running)`, `NRestarts=0`.
+- LAN: `curl -s -o /dev/null -w '%{http_code}' http://192.168.1.101:8000/v1/models`
+  from the Windows host -> **200**; `/v1/models` returns `deepseek-v4.1-flash`,
+  `context_length: 1048576`, modalities text+image.
+- A LAN chat completion from the Windows host returned `51` for `17*3` in 4.40 s
+  (HTTP 200).
+- `systemctl restart ds4-tp4.service`: **PASS**. Before: node1 `ds4-server` pid
+  345430, node2-4 `ds4` pids 587527/313409/312359. After 42 s:
+  345973/588063/313909/312818 — **0 orphaned processes**, exact counts node1
+  `1 ds4-server + 0 ds4`, node2-4 `1 ds4 + 0 ds4-server`.
+- A second restart after the journald routing fix also came back with
+  `rank 0/4 connected` in `journalctl -u ds4-tp4.service`.
+
+## Audit (2026-11-24)
+
+- Branch `feat/rocm-tp-full-stack`, HEAD `75eb65e` plus this docs commit (code
+  `f2a3863`), clean working tree.
+- `feat/rocm-tp-ring` = `49d6ce9`, `feat/usb4-rdma-ring` = `e26ee49` (untouched).
+- `ds4` md5 **6f3c1fe471ddced353807a65bab5c5d9** and `ds4-server` md5
+  **7db66c88681a710475a75077a82d9a6c** on node1-node4.

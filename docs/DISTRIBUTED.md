@@ -175,6 +175,9 @@ make test-tp-ring                                  # four ranks on loopback
 ./tests/test_tp_ring <rank> 4 <ip0,ip1,ip2,ip3> <port>   # across real nodes
 ```
 
+See [USB4_RDMA_RING.md](USB4_RDMA_RING.md) for the design, the four-node
+collective numbers and what is still two-rank.
+
 Build with `USE_USB4_RDMA=1` to compile the verbs backend; the default build
 needs no RDMA headers or libraries and links nothing extra. Pass
 `--tp-cpu-core N` to pin the ring thread while benchmarking, and set

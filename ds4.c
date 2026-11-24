@@ -74094,8 +74094,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    /* The ROCm backend implements ds4_gpu_deepseek4_vision_encode, so the
+     * V4.1 encoder is no longer Metal-only: allow it on ROCm and let the
+     * existing encoder/revision checks decide (ds4.c:7458). */
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
-        opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL) {
+        opt->vision_path && opt->vision_path[0] &&
+        e->backend != DS4_BACKEND_METAL
+#ifdef DS4_ROCM_BUILD
+        && 0
+#endif
+        ) {
         fprintf(stderr, "ds4: V4.1 vision requires Metal\n");
         ds4_engine_close(e);
         *out = NULL;

@@ -1,0 +1,132 @@
+18225: * Negative scales add it.  This is deliberately explicit and opt-in; with zero
+63513: * Keep it opt-in so greedy DSpark output is reproducible across runs. */
+73760:    return opt->warm_weights && !opt->inspect_only && !opt->ssd_streaming &&
+73761:           !opt->cuda_tensor_parallel && opt->tp.role == DS4_TP_NONE &&
+73762:           opt->distributed.role == DS4_DISTRIBUTED_NONE;
+73892:    const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096u;
+73895:    const char *sidecars[] = {opt->vision_path, opt->mtp_path};
+73973:    e->backend = opt->backend;
+73974:    e->quality = opt->quality;
+73975:    e->glm_mtp = opt->glm_mtp;
+73976:    e->glm_mtp_timing = opt->glm_mtp_timing;
+73977:    e->dspark = opt->dspark;
+73978:    e->dspark_strict = opt->dspark_strict;
+73979:    e->dspark_exact_sampling = opt->dspark_exact_sampling;
+73980:    e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
+73981:    e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
+73982:    e->ssd_streaming = opt->ssd_streaming;
+73983:    e->ssd_streaming_cold = opt->ssd_streaming_cold;
+73984:    e->ssd_streaming_full_layers_set = opt->ssd_streaming_full_layers_set;
+73985:    e->distributed = opt->distributed;
+73986:    e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
+73987:    if (opt->vision_path && opt->vision_path[0]) {
+73988:        if (opt->backend != DS4_BACKEND_METAL &&
+73989:            opt->backend != DS4_BACKEND_CUDA) {
+74002:        if (opt->backend == DS4_BACKEND_CUDA && gpu_cfg &&
+74012:        ds4_effective_prefill_chunk(opt->cuda_tensor_parallel,
+74013:                                    opt->prefill_chunk);
+74014:    e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
+74015:    e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
+74016:    e->ssd_streaming_full_layers = opt->ssd_streaming_full_layers;
+74017:    e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
+74019:    e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
+74021:    e->mtp_margin = opt->mtp_margin >= 0.0f ? opt->mtp_margin : 3.0f;
+74022:    if (opt->dspark_confidence_threshold_set) {
+74023:        e->dspark_confidence_threshold = opt->dspark_confidence_threshold;
+74029:        opt->dspark_confidence_threshold_set;
+74030:    if (opt->cuda_tensor_parallel &&
+74031:        (opt->backend != DS4_BACKEND_CUDA || !gpu_cfg ||
+74039:    if (opt->dspark && (!opt->mtp_path || !opt->mtp_path[0])) {
+74045:    if ((opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) &&
+74046:        (!opt->directional_steering_file || !opt->directional_steering_file[0]))
+74053:    if (opt->directional_steering_file && opt->directional_steering_file[0]) {
+74054:        e->directional_steering_file = ds4_strdup(opt->directional_steering_file);
+74055:        e->directional_steering_attn_scale = opt->directional_steering_attn;
+74056:        e->directional_steering_ffn_scale = opt->directional_steering_ffn;
+74058:    if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
+74059:    e->placement_ctx_hint = opt->placement_ctx_hint;
+74060:    e->placement_session_count_hint = opt->placement_session_count_hint;
+74063:    e->share_session_prefill_workspace = opt->share_session_prefill_workspace ||
+74064:        opt->tp.role == DS4_TP_WORKER;
+74067:    if (opt->simulate_used_memory_bytes != 0 &&
+74069:                                     opt->simulate_used_memory_bytes)) {
+74075:    bool load_slice = opt->load_slice;
+74076:    uint32_t load_layer_start = opt->load_layer_start;
+74077:    uint32_t load_layer_end = opt->load_layer_end;
+74078:    bool load_output = opt->load_output;
+74080:    if (opt->distributed.role != DS4_DISTRIBUTED_NONE &&
+74081:        opt->distributed.layers.set)
+74084:        load_layer_start = opt->distributed.layers.start;
+74085:        load_layer_end = opt->distributed.layers.end;
+74086:        load_output = opt->distributed.layers.has_output;
+74091:            opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR;
+74094:    const bool graph_backend = ds4_backend_uses_graph(opt->backend);
+74095:    if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
+74096:    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+74098:        opt->vision_path && opt->vision_path[0] && e->backend != DS4_BACKEND_METAL) {
+74110:    if (ds4_model_is_qwen4() && !opt->inspect_only) {
+74122:            (opt->first_token_test && e->backend == DS4_BACKEND_CPU);
+74123:        if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
+74125:            opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
+74126:            (e->ssd_streaming && (opt->first_token_test || e->backend != DS4_BACKEND_METAL)) || opt->dspark || e->power_percent != 100 ||
+74127:            (opt->mtp_path && opt->mtp_path[0])) {
+74136:    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
+74139:                (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
+74147:            opt->distributed.role == DS4_DISTRIBUTED_NONE &&
+74148:            !load_slice && !opt->glm_mtp &&
+74149:            !opt->first_token_test && !opt->metal_graph_test &&
+74150:            (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
+74151:            e->power_percent == 100 && opt->context_size <= 1048576;
+74162:        e->model_path = realpath(opt->model_path, NULL);
+74172:    if (opt->vision_path && opt->vision_path[0]) {
+74188:        model_open(&e->vision_model, opt->vision_path, true, false);
+74251:    const char *expert_profile_path = opt->expert_profile_path;
+74292:    const bool resident_tp = opt->tp.role != DS4_TP_NONE && !e->ssd_streaming;
+74297:    const int tp_shard_world = opt->tp.world_size > 1 ? opt->tp.world_size : 2;
+74298:    const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ?
+74299:        (opt->tp.rank_index > 0 ? opt->tp.rank_index : 1) : 0;
+74307:        (gpu_cfg && gpu_cfg->n_gpus > 1) || opt->quality)) {
+74363:    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
+74364:        const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
+74376:        if (opt->inspect_only) {
+74380:        if (opt->first_token_test) {
+74414:        if (opt->inspect_only) {
+74419:            ((opt->directional_steering_file && opt->directional_steering_file[0]) ||
+74420:             opt->directional_steering_attn != 0.0f ||
+74421:             opt->directional_steering_ffn != 0.0f)) {
+74433:        if (opt->prefill_chunk != 0) {
+74441:        if (opt->mtp_path && opt->mtp_path[0]) {
+74447:        if (opt->first_token_test) {
+74492:        if (opt->context_size > 0) {
+74494:            if (!glm_graph_context_request(opt->context_size, &guard_ctx) ||
+74518:    } else if (!opt->inspect_only) {
+74526:    if (opt->glm_mtp &&
+74548:                                                  opt->context_size,
+74562:    if (opt->inspect_only) {
+74563:        if (opt->mtp_path && opt->mtp_path[0] &&
+74564:            opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+74565:            model_open(&e->mtp_model, opt->mtp_path, false, false);
+74664:    if (opt->mtp_path && opt->mtp_path[0] &&
+74665:        opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+74672:        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+74682:            if (opt->tp.role != DS4_TP_NONE) {
+74693:                        opt->mtp_path,
+74712:                    opt->mtp_path,
+74730:                    opt->mtp_path,
+74840:            if (ds4_dspark_spark_tp_policy(e, opt->tp.role != DS4_TP_NONE))
+74845:                 (opt->tp.role != DS4_TP_NONE &&
+74854:                e->backend, opt->context_size > 0 ? opt->context_size : 4096, e->prefill_chunk, true);
+74864:        if (!ds4_engine_configure_streaming_auto_cache(e, opt->context_size) ||
+74872:            const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
+74889:                opt->context_size);
+74898:                    opt->context_size,
+74918:                        e->backend, opt->context_size, e->prefill_chunk, true);
+75025:                                                  opt->model_path);
+75028:                e->model.size, e->model.file_size, opt->model_path, (uint32_t)tp_shard_rank);
+75032:                    tp_mxfp4_expert_split_build(e, opt->model_path,
+75333:                                     opt->tp.transport != DS4_TP_TRANSPORT_TCP)) {
+75335:                tp_dspark_expert_split_build(e, opt->mtp_path, (uint32_t)tp_shard_rank);
+75380:    if (!opt->inspect_only) {
+75381:        ds4_engine_print_startup_memory(e, opt->context_size);
+78274:             * states. Keep the resident ROCm continuation path opt-in until
+84652:     * verifier state when it can be committed safely: DSpark is an opt-in

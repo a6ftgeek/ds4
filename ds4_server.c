@@ -7234,6 +7234,14 @@ static bool stream_needs_second_reasoning_guard(const request *r) {
            r->model_syntax != SERVER_MODEL_SYNTAX_QWEN;
 }
 
+/* An untagged second reasoning pass can only be routed to reasoning_content
+ * once its closing </think> appears. Waiting for that tag unconditionally
+ * means a plain-text answer -- which never emits it -- is held for the whole
+ * generation, so the SSE stream goes silent and clients hit their idle
+ * timeout. Cap the wait at this many bytes of held text; past it the run is
+ * treated as the answer. */
+#define DS4_SECOND_REASONING_HOLD_BYTES 16
+
 static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
@@ -8132,7 +8140,13 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
                 if (limit > st->emit_pos) st->sent_reasoning = true;
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
+            } else if (!tool && !final &&
+                       raw_len - st->emit_pos <
+                           DS4_SECOND_REASONING_HOLD_BYTES) {
+                /* Ambiguous: this could still be an untagged second
+                 * reasoning pass that ends with a bare </think>. Hold only
+                 * a bounded prefix so a text-only answer cannot stall the
+                 * stream until the client gives up. */
                 return true;
             } else {
                 st->guard_second_reasoning = false;
@@ -9767,7 +9781,13 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
                 if (!anthropic_sse_close_block_live(fd, id, st)) return false;
                 st->emit_pos = limit + strlen("</think>");
                 st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
+            } else if (!tool && !final &&
+                       raw_len - st->emit_pos <
+                           DS4_SECOND_REASONING_HOLD_BYTES) {
+                /* Ambiguous: this could still be an untagged second
+                 * reasoning pass that ends with a bare </think>. Hold only
+                 * a bounded prefix so a text-only answer cannot stall the
+                 * stream until the client gives up. */
                 return true;
             } else {
                 st->guard_second_reasoning = false;

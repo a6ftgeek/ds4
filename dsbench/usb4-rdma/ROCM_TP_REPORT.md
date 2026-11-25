@@ -1054,3 +1054,76 @@ serial ring exchanges themselves. Merging the two gates per layer is not
 possible without changing the math (the FFN input depends on the attention
 output), so the realistic options are a faster link or a lower-latency
 collective, not more kernel work.
+
+# TIER 4 — USB4 ring payload compression and prefill overlap: analysis, not implemented
+
+Worked 2026-11-25 on `feat/rocm-tp-perf` after Tier 3. Outcome: **no code
+changed**. The payload arithmetic below puts the ceiling at a few percent of
+prefill and zero on decode, which is below the risk of changing the wire format
+of a lockstep ring; the overlap question is answered from the dependency graph
+and is negative.
+
+## 1. What the ring actually carries, and what compressing it would buy
+
+The two exchanges are the same 4096-wide float row matrix that the model
+all-reduces (`ds4_gpu_tp_gate_encode` -> `ds4_tp_ring_all_reduce` ->
+`usb4_rdma_ring_all_reduce`), so per layer and chunk:
+
+```
+attn gate payload = rows x 4096 x 4 B
+ffn  gate payload = rows x 4096 x 4 B
+per chunk          = rows x 1.31 MB   (40 layers, 2 gates)
+```
+
+| prompt | payload per rank | ring time at ~2.5 GB/s/link | share of measured prefill |
+|---|---:|---:|---:|
+| 4K (3061 rows) | 4.0 GB | ~2.4 s | ~6% of 37.7 s |
+| 16K (11843 rows) | 15.5 GB | ~9.3 s | ~10% of 92.9 s |
+| 64K (44781 rows) | 58.7 GB | ~35 s | ~11% of 306.8 s |
+
+The link figure is the one measured during bring-up: each USB4 path negotiates
+`10.0 Gb/s x 2 lanes` without H2H (`dsbench/usb4-rdma/readiness.md:95`,
+`findings.md:162`), i.e. ~2.5 GB/s per link, and a ring all-reduce moves roughly
+`2 x payload x (N-1)/N` across the four links.
+
+So BF16 payloads (2x fewer bytes) would be worth **~3% at 4K and ~5% at 64K
+prefill**, and **0% on decode**: a decode gate is 20 KB and is latency-bound
+(80 round trips per token), not bandwidth-bound. A 6-bit Walsh-Hadamard variant
+would double that again, but only on prefill.
+
+That is the whole upside. Against it: the gate payload is the model's partial
+sum, so a lossy encoding is a numerical change in the all-reduce that has to be
+verified end to end (needle recall, vision, tool calling) on every rank at every
+chunk size, and the ring has no framing slack for a mixed-precision payload
+without a both-ends agreement step. With Tiers 1-3 already spending the
+available time and the end-to-end sweep still to run, changing the wire format
+for ~3-5% of prefill was not a good trade. **Not implemented**; the measurement
+above is the record of why.
+
+## 2. Can chunked prefill compute overlap with ring transfers?
+
+No, within a chunk, and the code makes the reason explicit. Per layer:
+
+```
+hc/attn compute -> ds4_gpu_tp_gate_encode(ATTN) -> ring all-reduce -> attn out
+               -> FFN compute -> ds4_gpu_tp_gate_encode(FFN) -> ring all-reduce -> routed out
+               -> next layer
+```
+
+`ds4.c:26002-26056` (attention-output gate) and `ds4.c:27704-27748` (FFN gate)
+sit between the two compute blocks that consume their results, and the FFN
+cannot start before the attention-output reduce lands. Layers are sequential for
+the same reason. The only way to overlap would be two independent row chunks in
+flight, which the ring's single in-flight collective does not permit
+(`ds4_tp_batch_block_begin_gates` refuses a second window while
+`r->block_active`).
+
+The one place overlap already happens is Engram: its table reads are issued
+asynchronously ahead of the layer that consumes them
+(`ds4_engram_read_batch_start` / `_finish`). That is why Engram I/O is not
+visible in the profile.
+
+## 3. Accuracy
+
+Nothing changed, so there is no accuracy delta to report for this tier. The
+end-to-end gate for the shipped binary is in the wrap-up section below.

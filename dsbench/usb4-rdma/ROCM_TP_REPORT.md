@@ -1221,3 +1221,95 @@ rejects the whole reuse. The tree already has a trace facility for exactly this
 the server runs with `--trace`); running the service with `--trace` and following
 one multi-turn request is the way to close this out. Flagged rather than fixed:
 it is a pre-existing server-side behaviour, not a change from Tiers 1-4.
+
+# 2026-11-25 (second session) — Avenue 1-3 on `feat/rocm-tp-perf`
+
+Continued from `d6a8ae7`. Final binary `ds4` md5 `1d92b58c0f83722534f10e05de0a8d8a`,
+`ds4-server` `9324cffc43033fb11830ac2545580a27`, identical on all four ranks.
+Service runs its pristine unit config (`CTX=1048576`, vision on, no DSpark, no
+drop-ins), `NRestarts=0`.
+
+## Avenue 1 — DSpark at TP=4: one real bug fixed, acceptance still 0
+
+**Drafter identity verified first:** all four ranks load the V4.1 support file
+(sha256 `14f04ebf7314342d78921e2b9e28d8806fedc93a6551b72079fccd2f9ec5497b`,
+8,633,942,016 B, `stages=3 block=5 markov_rank=256`), not the older V4 0731 drafter.
+
+**Bug found and fixed:** `ds4_deepseek41_dspark.h` suspended ROCm expert sharding
+for the leader-local drafter only when `tp_world == 2`, so at TP=4 the drafter's
+routed MoE still ran with rank 0's contiguous quarter of the expert tables — the
+same `== 2` -> `>= 2` defect fixed for the V4 Flash drafter. After the fix the
+draft cost rose 60 ms -> 92 ms per 5-token proposal, confirming the drafter now
+sweeps all 128 experts.
+
+**Acceptance is still 0/160**, so a second defect remains in the ROCm drafter
+path. It has never been exercisable at TP>=2 (the model needs all four nodes to
+be resident, so TP=1/TP=2 cannot be run for comparison). The instrumented probe
+shows the verifier is correct (its row-0 argmax becomes the next cycle's `t0`)
+while the proposals are unrelated (`t0=109405` -> drafts 305/367/418/463 against
+the target's own 127869/33372). Not a verify-row offset, not a draft-broadcast
+divergence: at world>2 no draft frame is exchanged and only rank 0 drafts.
+
+**Verify block stays 1.5-4.2 s** for a 5-6 row block, i.e. ~20-25 ms per gate.
+`ds41_dspark_verify` gates the pre-posted small-row window on `tp_world == 2`;
+at N ranks every one of the 80 gates pays the bulk-prefill handshake
+(`ds4_tp_batch_block_begin_gates` pre-posts one layer's receives against a
+single peer, which the ring collective does not provide). Porting that window
+to the N-rank ring is the fix, and it only pays once acceptance works.
+
+DSpark therefore stays **off by default**; the expert-sharding fix is
+correctness-only and cannot affect the shipped stack.
+
+## Avenue 2 — the KV prefix `token-mismatch` was a server-side rendering bug
+
+`--trace` (now wired to the launcher as `TRACE_PATH`) printed the divergence:
+
+```
+919 == live 128804 "<|Assistant|>"  prompt 128804 "<|Assistant|>"
+920 != live 128821 "<think>"        prompt 128822 "</think>"
+```
+
+The engine generates `<|Assistant|><think>{reasoning}</think>`, but both chat
+renderers emitted a bare `</think>` for any assistant turn that was not the live
+tail and not in a tool context (`tool_context || i > last_user_idx`,
+`keep_reasoning || i > last_user`). Every reply from this model carries
+reasoning, so **prefix reuse was impossible on essentially every multi-turn
+request**, which is why the earlier sweep saw `cached_tokens=0`.
+
+Fix: render the reasoning block whenever the client supplied one
+(`DS4_CHAT_NO_REPLAY_REASONING` restores the old rendering).
+
+| case | prefill before | prefill after | cached |
+|---|---:|---:|---|
+| plain multi-turn | 11.524 s | **1.071 s** (-90.7%) | 929/978 |
+| tool-calling turn | 11.083 s | **0.864 s** (-92.2%) | 942/970 |
+
+## Avenue 3 — prefill tile sweep: no win, default kept
+
+`DS41_PREFILL_CAP` is now tunable (`DS4_V41_PREFILL_CAP`, 2048..32768, default
+8192 unchanged). Matched A/B, 832K context, 16K prompt, same binary:
+
+| tile | prefill | graph buffers | planned |
+|---|---:|---:|---:|
+| 8192 (default) | 126.96 t/s | 11.43 GiB | 97.08 GiB |
+| 16384 | 127.26 t/s | 19.56 GiB | 105.21 GiB |
+
++0.24% for +8.13 GiB, and the wide tile no longer fits admission at 1M context
+(110.05 vs 109.44 GiB). Prefill is weight-bandwidth bound per chunk, not step
+bound. Default stays 8192; the knob is kept as a documented diagnostic.
+
+## Final sweep (shipped binary, pristine unit)
+
+| context | prompt tok | prefill | TTFT | decode | needle |
+|---|---:|---:|---:|---:|---|
+| short | 124 | 64.16 t/s | 1.94 s | — | — |
+| short | 229 | 67.02 t/s | 3.42 s | — | — |
+| 4K | 3061 | 81.43 t/s | 37.60 s | 12.72 t/s | recalled |
+| 16K | 11843 | 125.50 t/s | 94.37 s | 13.18 t/s | recalled |
+| 64K | 44781 | 145.17 t/s | 308.48 s | 12.86 t/s | recalled |
+
+* Multi-turn KV reuse: `cached_tokens=929/978`, prefill 11.52 s -> 1.07 s.
+* Vision PNG: red circle, blue square, "CAT 347" — correct.
+* Tool calling: two structured calls with valid JSON arguments.
+* `NRestarts=0`; zero RNR / retry / timeout / desync / QP-error lines for the
+  whole run (the only grep hit is the benign `gate-timeout=750ms` startup line).

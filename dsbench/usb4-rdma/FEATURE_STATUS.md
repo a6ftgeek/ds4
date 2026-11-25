@@ -1255,3 +1255,73 @@ serving. The change needs its own bring-up with `make test-tp-ring` plus a
 deliberate desync test, not a build-deploy-verify cycle inside a serving window.
 The Stage 1/Stage 2 structure from `2d96423` is already in place and stays
 opt-in, so the fast path has only to be dropped in behind it.
+
+### 2026-11-25 (ninth session, maintenance window) — fast verify window lands; Stage 1 still loses
+
+Implemented the ring-aware fast batch window on top of `1fdb863`, validated it on
+the live 4-node ring inside the authorized window, and restored the service
+pristine at the end. The window works and is safe, but Stage 1 remains a
+pessimization, so everything stays opt-in and DSpark stays off.
+
+#### What was implemented
+
+`ds4_tp.c` / `ds4_tp.h`:
+
+* the pre-posted verify-block window now has a **slot progression**
+  (`block_slot0`, `block_slot_step`), so one block can cover every second gate
+  slot (the FFN slots 1,3,5,...,79) while keeping its per-gate ordering rule;
+  the two-rank path is unchanged because `ds4_tp_batch_block_begin_gates` resets
+  the pair to 0/1;
+* `ds4_tp_batch_block_begin_slots()` exposes that to N ranks;
+* `tp_rdma_block_post_layer`/`tp_rdma_block_gate_exchange` map ordinal -> slab
+  slot through the progression, so the GPU layer can keep passing the slot it
+  already uses (`il*2+gate`).
+
+`ds4.c`: the verify branch opens one block window for the whole block when
+`DS4_VERIFY_BATCH_FFN_GATE=1` and `DS4_VERIFY_FAST_BATCH_GATE` is not `0`
+(default: enabled when Stage 1 is on), and closes it after the sweep. The
+existing `ds41_sum_partial_batch` call then routes through
+`tp_rdma_block_gate_exchange` automatically, because `block_active` makes
+`ds4_tp_batch_gate_exchange` take the block path instead of
+`tp_rdma_big_gate_exchange`. It falls back to the barrier path (with a log line)
+if the window cannot be opened.
+
+#### Measured on the live 4-node ring
+
+| 6-row block | gates | layers |
+|---|---:|---:|
+| baseline (Stage 1 off, per-row gates) | 480 | **446 ms** |
+| Stage 1, barrier gate (`2d96423`) | 280 | 1700 ms |
+| Stage 1 + fast window (this commit) | **280** | **985 ms** |
+
+Output is identical in every configuration (`We need answer? User just wrote "`),
+zero RNR / timeout / desync / "out of order" lines, `NRestarts=0`, and the
+window opens and closes cleanly (no fallback message in the journal).
+
+#### Why it is still slower
+
+The window halves the batched gate (37 ms -> ~19 ms) but a block gate still costs
+~19 ms against ~0.93 ms for a row gate, so 40 batched gates (762 ms) still
+dominate the 240 row gates they save (223 ms). The remaining cost scales with the
+number of posted messages, not bytes: a 6-row payload is `rows * ceil(vec_bytes /
+16384)` = 12 sends, and the block path posts the next gate's receives on every
+gate, whereas the row path amortizes one barrier across a 16-deep window. Getting
+to ~1 ms per batched gate therefore needs the block window to post receives
+several gates ahead and to reuse a deeper ring window, i.e. the `R
+DS4_TP_RDMA_BATCH_WINDOW` depth-8 sliding design rather than one-gate lookahead.
+
+Consequently Stage 2 (attention batching, 80 gates) would cost 80 x ~19 ms
+~1.5 s and was not attempted.
+
+#### State
+
+* `DS4_VERIFY_BATCH_FFN_GATE` and `DS4_VERIFY_FAST_BATCH_GATE` are opt-in; the
+  default decode path is byte-for-byte the `75f5613` behaviour (446 ms / 480
+  gates).
+* DSpark stays **off** in `ds4-tp4.service`; net decode is unchanged at 7.87 t/s
+  (4K) against 13.41 t/s plain.
+* Service restored pristine (`CTX=1048576`, no drop-ins, no DSpark), `NRestarts=0`,
+  api 200, zero ring errors.
+* Regression gate on the new binary (`ds4` `52ab3aac2b29069b48add7a80fce27d4`):
+  tool calling (two structured calls), Vision (red circle / blue square / CAT
+  347), multi-turn KV reuse `cached 929/978` (-32% TTFT).

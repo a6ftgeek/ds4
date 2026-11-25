@@ -41172,9 +41172,24 @@ static void ds41_dspark_reset(ds41_dspark *d);
 static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
                                 const ds4_gpu_tensor *residual, uint32_t rows);
 
+/* Long-context prefill tile. The graph buffers and the batch workspace are
+ * sized from this value, so raising it costs memory linearly; DS4_V41_PREFILL_CAP
+ * lets a deployment trade GTT for a wider chunk (2048..32768, default 8192). */
+static uint32_t ds41_prefill_cap(void) {
+    const char *env = getenv("DS4_V41_PREFILL_CAP");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        const long v = strtol(env, &end, 10);
+        if (end != env && errno == 0 && v >= 2048 && v <= 32768)
+            return (uint32_t)v;
+    }
+    return DS41_PREFILL_CAP;
+}
+
 static uint32_t ds41_prefill_limit(uint32_t ctx) {
     const uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
-        (ctx < 16384u || getenv("DS4_METAL_DISABLE_V41_8K_CHUNK")) ? 4096u : DS41_PREFILL_CAP;
+        (ctx < 16384u || getenv("DS4_METAL_DISABLE_V41_8K_CHUNK")) ? 4096u : ds41_prefill_cap();
     return ctx < limit ? ctx : limit;
 }
 

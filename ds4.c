@@ -44634,13 +44634,51 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
          * through the exact decode layer, which is bit-identical to decode.
          * DS4_VERIFY_BATCHED_LAYER restores the old batched pipeline for A/B. */
         if (ok && g->verify_prefix && !getenv("DS4_VERIFY_BATCHED_LAYER")) {
+            /* Per-row decode compute (bit-identical to plain decode) with the
+             * FFN all-reduce batched over the block: one gate per layer instead
+             * of one per row. A gate is a per-row all-reduce, so exchanging all
+             * rows in one payload leaves every row's arithmetic unchanged. The
+             * producer writes its partial into the shared single-row
+             * tp_out[FFN] slot, so each row is staged into its own batch slice
+             * before the batched exchange. DS4_VERIFY_BATCH_FFN_GATE=0 keeps
+             * the per-row gate for A/B. */
+            /* Measured: the batch gate API costs ~37 ms per exchange (it
+             * posts a window barrier and a big-gate transfer per call) against
+             * ~0.93 ms for the single-row gate, so 40 batched FFN gates are
+             * 1477 ms where the 240 row gates they replace are 223 ms. This
+             * stays opt-in until the transport can carry a multi-row payload
+             * on the fast row path. */
+            const char *ffn_opt = getenv("DS4_VERIFY_BATCH_FFN_GATE");
+            const bool batch_ffn = ffn_opt && ffn_opt[0] == '1';
+            const uint32_t ffn_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
+            const bool stage = batch_ffn && g->tp_out && !ds41_tp_slab_off();
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph row = *graphs[i];
                 row.pos = positions[i];
-#define DS41_BISECT_ROW_VIEW(name, width) row.name = g->rows_view[i].name;
-                DS41_PREFILL_ROWS(DS41_BISECT_ROW_VIEW)
-#undef DS41_BISECT_ROW_VIEW
-                ok = ds41_graph_layer(&row, model, &weights->layer[il], il, tokens[i]);
+#define DS41_VROW(name, width) row.name = g->rows_view[i].name;
+                DS41_PREFILL_ROWS(DS41_VROW)
+#undef DS41_VROW
+                ok = ds41_graph_before_moe(&row, model, &weights->layer[il], il);
+                if (ok && batch_ffn)
+                    ok = ds41_moe_partial(&row, model, &weights->layer[il], il,
+                                          (uint32_t)tokens[i], true) &&
+                         (!stage || ds4_gpu_tensor_copy(g->rows_view[i].block, 0,
+                                                        g->tp_out[ffn_slot], 0,
+                                                        (uint64_t)DS4_N_EMBD * 4u));
+                else if (ok)
+                    ok = ds41_moe(&row, model, &weights->layer[il], il, tokens[i]);
+            }
+            if (ok && batch_ffn)
+                ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_FFN, rows);
+            for (int i = 0; ok && i < count; i++) {
+                ds41_gpu_graph row = *graphs[i];
+                row.pos = positions[i];
+#define DS41_VROW2(name, width) row.name = g->rows_view[i].name;
+                DS41_PREFILL_ROWS(DS41_VROW2)
+#undef DS41_VROW2
+                ok = (!batch_ffn || ds41_bf16(row.block, DS4_N_EMBD)) &&
+                     ds41_graph_after_moe(&row, model, &weights->layer[il], il,
+                                          il + 1u == DS4_N_LAYER);
             }
             if (!ok) break;
             continue;

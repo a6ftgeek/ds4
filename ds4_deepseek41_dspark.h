@@ -325,6 +325,20 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
     return ok;
 }
 
+/* Diagnostic helper: argmax with a NaN scan, for the DSpark probe. */
+static DS4_MAYBE_UNUSED int ds41_dspark_dbg_argmax(const float *v, uint32_t n, float *best) {
+    int bi = -1;
+    float bv = -INFINITY;
+    bool nan = false;
+    for (uint32_t i = 0; i < n; i++) {
+        const float x = v[i];
+        if (!(x == x)) { nan = true; continue; }
+        if (x > bv) { bv = x; bi = (int)i; }
+    }
+    *best = bv;
+    return nan ? -2 : bi;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model *m,
                                uint32_t row, int previous, float *confidence) {
     if (!d || row >= DS41_DRAFT_ROWS || previous < 0 ||
@@ -336,10 +350,21 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
         return false;
     const uint64_t bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
     ds4_gpu_tensor *logits = ds4_gpu_tensor_view(d->logits, row * bytes, bytes);
+    /* Probe: keep the drafter's own base logits so the print below can separate
+     * "the draft network is wrong" from "the Markov bias overrides it". */
+    const bool dbg = getenv("DS4_DSPARK_SPEC_DEBUG") != NULL;
+    float *dbg_base = dbg ? malloc(bytes) : NULL;
+    if (dbg_base && logits)
+        (void)ds4_gpu_tensor_read(logits, 0, dbg_base, bytes);
     bool ok = logits && ds4_gpu_begin_commands() &&
         ds4_gpu_tensor_write(d->markov_embed, 0, embedding, sizeof(embedding)) &&
         ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
-        ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB) &&
+        /* DS4_DSPARK_NO_MARKOV isolates the draft network from the Markov
+         * bias. The converted head adds up to +/-50 logits, far above the
+         * base distribution's spread, so it is the prime suspect for the
+         * proposals being unrelated to the target. */
+        (getenv("DS4_DSPARK_NO_MARKOV") != NULL ||
+         ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB)) &&
         ds4_gpu_tensor_copy(d->confidence_input, 0, d->batch.x,
             (uint64_t)row * DS4_N_EMBD * 4u, (uint64_t)DS4_N_EMBD * 4u) &&
         ds4_gpu_tensor_copy(d->confidence_input, (uint64_t)DS4_N_EMBD * 4u,
@@ -348,6 +373,16 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (ok) ok = ds4_gpu_tensor_read(logits, 0, d->host_logits + (uint64_t)row * DS4_N_VOCAB, bytes) &&
         ds4_gpu_tensor_read(d->confidence, 0, confidence, sizeof(*confidence));
+    if (ok && dbg_base) {
+        float bb = 0.0f, pb = 0.0f;
+        const int bi = ds41_dspark_dbg_argmax(dbg_base, DS4_N_VOCAB, &bb);
+        const int pi = ds41_dspark_dbg_argmax(d->host_logits + (uint64_t)row * DS4_N_VOCAB,
+                                              DS4_N_VOCAB, &pb);
+        fprintf(stderr, "ds4: DSPARK_MKV row=%u prev=%d base_top=%d(%.3f) "
+                        "post_top=%d(%.3f) conf=%.3f\n",
+                row, previous, bi, bb, pi, pb, *confidence);
+    }
+    free(dbg_base);
     ds4_gpu_tensor_free(logits);
     return ok;
 }

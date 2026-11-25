@@ -44587,6 +44587,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #ifdef __APPLE__
         const bool batch_attention = prefill_only;
 #else
+        /* Tried enabling ds41_attention_batch for ROCm verify blocks
+         * (DS4_ROCM_DISABLE_VERIFY_BATCH_ATTN was the kill switch): the block
+         * degraded into a BOS loop and the verify stayed 1.6-2.5 s, so the
+         * per-row fallback remains. The cost and the wrong logits are in the
+         * verify forward itself, not in this selector. */
         const bool batch_attention = false;
 #endif
         if (ok && batch_attention) ok = ds41_attention_batch(g, model, l, il, rows);
@@ -88709,16 +88714,29 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     if (!ds41_session_verify(s, tokens, count)) goto fail;
     if (getenv("DS4_DSPARK_SPEC_DEBUG")) {
         /* Phase-1 probe: are the drafts rejected because the verifier's rows
-         * are offset, or because the drafter's proposals are unrelated? */
+         * are offset, or because the drafter's proposals are unrelated? The
+         * decoded text makes a one-position shift obvious on a counting
+         * prompt, and DSPARK_MKV (drafter) separates the draft network from
+         * the Markov bias. */
         const int v0 = sample_argmax(d->host_verified, DS4_N_VOCAB);
         const int v1 = count > 2 ? sample_argmax(d->host_verified + DS4_N_VOCAB, DS4_N_VOCAB) : -1;
-        const int v2 = count > 3 ? sample_argmax(d->host_verified + 2 * DS4_N_VOCAB, DS4_N_VOCAB) : -1;
         const int dl = d->host_logits ? sample_argmax(d->host_logits, DS4_N_VOCAB) : -1;
+        char *txt_t0 = ds4_token_text(s->engine, tokens[0], NULL);
+        char *txt_t1 = count > 1 ? ds4_token_text(s->engine, tokens[1], NULL) : NULL;
+        char *txt_t2 = count > 2 ? ds4_token_text(s->engine, tokens[2], NULL) : NULL;
+        char *txt_v0 = v0 >= 0 ? ds4_token_text(s->engine, v0, NULL) : NULL;
+        char *txt_v1 = v1 >= 0 ? ds4_token_text(s->engine, v1, NULL) : NULL;
+        char *txt_dr = dl >= 0 ? ds4_token_text(s->engine, dl, NULL) : NULL;
         fprintf(stderr,
-                "ds4: DSPARK_DBG count=%u t0=%d t1=%d t2=%d t3=%d | v0=%d v1=%d v2=%d | draft_row0=%d\n",
-                count, tokens[0], count > 1 ? tokens[1] : -1,
-                count > 2 ? tokens[2] : -1, count > 3 ? tokens[3] : -1,
-                v0, v1, v2, dl);
+                "ds4: DSPARK_DBG count=%u | t0=%d '%s' t1=%d '%s' t2=%d '%s'\n"
+                "ds4: DSPARK_DBG        | v0=%d '%s' v1=%d '%s' | draft0=%d '%s'\n",
+                count, tokens[0], txt_t0 ? txt_t0 : "?",
+                count > 1 ? tokens[1] : -1, txt_t1 ? txt_t1 : "?",
+                count > 2 ? tokens[2] : -1, txt_t2 ? txt_t2 : "?",
+                v0, txt_v0 ? txt_v0 : "?", v1, txt_v1 ? txt_v1 : "?",
+                dl, txt_dr ? txt_dr : "?");
+        free(txt_t0); free(txt_t1); free(txt_t2);
+        free(txt_v0); free(txt_v1); free(txt_dr);
     }
     uint32_t keep = 1;
     int correction = -1;

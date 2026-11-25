@@ -861,3 +861,108 @@ DSPARK=1 CTX=917504 DSPARK_CONF=0.7 DSPARK_STATS=1 bash launch_tp4_best.sh start
 
 The flags are applied to **all four ranks** (the verify is mirrored by every
 rank). Baseline configuration and performance are unchanged.
+
+# TIER 2 — short-prefill widening (kept) and a batched attention-output kernel (measured, dropped)
+
+Worked 2026-11-25 on `feat/rocm-tp-perf` after Tier 1. Outcome: **short prompts
+are 4.7-5.4x faster to prefill**; the batched 2D kernel was implemented, proved
+bit-exact, showed no measurable gain, and was reverted.
+
+## 1. The short-prefill cliff (<256 tokens)
+
+`ds41_prefill_count` (`ds4.c`) returned a batch width of **1** whenever the
+pending append was under 256 tokens, so a short prompt ran one gated pass per
+row: 80 USB4 ring exchanges *per token* instead of once per chunk. The
+server's 128-token mixed quantum hit this on every short agentic turn.
+
+Resident ROCm TP now keeps short appends on the batched sweep:
+
+```c
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (!g->streaming && g->tp_world >= 2 &&
+        !getenv("DS4_ROCM_DISABLE_V41_TP_SMALL_PREFILL")) minimum = 8u;
+#endif
+```
+
+`DS4_ROCM_DISABLE_V41_TP_SMALL_PREFILL=1` restores the old behaviour for A/B.
+The threshold is 8 (not 2) so a one-token append still takes the exact
+single-row path, and image prompts are untouched (they stay token-major by
+design through the separate `g->image_count` gate).
+
+### Same-binary A/B (`DS4_ROCM_DISABLE_V41_TP_SMALL_PREFILL`), one binary, one ctx
+
+| prompt | token-major (old) | batched (new) | speedup | TTFT old -> new |
+|---|---:|---:|---:|---:|
+| 124 tokens | 13.66 t/s | **64.2-65.0 t/s** | **4.7x** | 9.08 s -> 1.93 s |
+| 229 tokens | 12.58 t/s | **68.3 t/s** | **5.4x** | 18.21 s -> 3.36 s |
+
+Against the pre-Tier-2 baseline recorded earlier (115 tokens 14.22 t/s, 220
+tokens 12.71 t/s) the shape is identical; the A/B above is the rigorous pair
+because only the env flag differs.
+
+### Long prompts are unchanged
+
+| context | before | after |
+|---|---:|---:|
+| 276 tokens | 75.97 t/s | 77.19 t/s |
+| 4K (3061 tok) | 81.31 t/s | 80.44 t/s |
+| 16K (11843 tok) | 127.48 t/s | 127.29 t/s |
+| 64K (44781 tok) | 145.98 t/s | 144.21 t/s |
+
+Prompts >= 256 tokens take the identical code path with an identical threshold,
+so their output is byte-for-byte unchanged by construction.
+
+### Parity of the widened path
+
+For <256-token prompts the batched path produces **different but coherent**
+greedy text than the old token-major path (124 tok: `2db15dd6` vs `16bf1de4`;
+229 tok: `0f8d29ae` vs `a13af534`). That is the documented floating-point
+reduction-order effect, not a defect: **TP=1 resident already used the batched
+path for every append >= 8 tokens** (`minimum = 8u` on the `tp_world == 1`
+branch), so before this change a 124-token prompt produced one answer at TP=4
+and a different one at TP=1. The widening removes that topology-dependent
+switch. Tool calling and vision work unchanged (section 3).
+
+## 2. Batched 2D attention-output kernel — built, bit-exact, no gain, reverted
+
+Tier 2's kernel item: `ds4_gpu_attention_output_low_q8_rows_exact_tensor`
+(`rocm/ds4_rocm_attention_launch.cuh`) looped `n_rows` times over the scalar
+split-K16x8 entry point, i.e. two launches plus one 256 KB staging allocation
+per row, per layer. A chunked prefill therefore paid 2 x rows x 40 launches per
+chunk (e.g. 3.6M launches for a 64K prefill).
+
+Implemented: two new HIP kernels in `rocm/ds4_rocm_q8.cuh`
+(`grouped_q8_0_a_partial16_w32_rows_kernel` with the row in `blockIdx.z`, and
+`q8_partial_sum8_rows_kernel`), driven in tiles of 8 rows so the split-K staging
+buffer stayed at 2 MB. Same split slice, same 16-block order, same warp
+reduction and same 8-way partial sum as the scalar kernel, so it is bit-exact
+by construction.
+
+Measured (same binary, `DS4_ROCM_DISABLE_ATTN_OUT_ROWS_BATCH` A/B):
+
+| context | per-row loop | batched rows | delta |
+|---|---:|---:|---:|
+| 124 tokens | 64.19 t/s | 64.23 t/s | +0.06% |
+| 4K | 79.97 t/s | 80.44 t/s | +0.6% |
+| 16K | 127.29 t/s | 125.92 t/s | -1.1% |
+
+Bit-exactness confirmed: identical generated text both arms
+(`2db15dd6` at 124 tokens, `844924a5` at 4K).
+
+**Dropped.** Launch overhead is not on the prefill critical path: the HIP
+launches are already queued asynchronously behind the GPU work, so replacing
+16k launches with 2k changes nothing measurable. Keeping 106 lines of extra
+kernel code for a result inside the noise band is not justified; reverted, with
+the measurement recorded here.
+
+## 3. Gate after Tier 2 (binary `ds4` md5 `cc86676a…`, identical on all four nodes)
+
+* Text coherence: correct (`17*23` -> `391`).
+* Vision PNG: "a large, solid red circle … a large, solid blue square … the text
+  "CAT 347"" — all three elements correct.
+* Tool calling: two structured `tool_calls` with correct names and JSON
+  arguments (`read_file {"/etc/hostname"}`, `run_tests {"unit"}`).
+* `NRestarts=0`, zero RNR / retry / timeout / desync / QP-error lines in the
+  coordinator or any worker log.
+* GTT 101,427 MiB (node1) / 100,515 / 100,515 / 100,501 MiB; MemAvailable
+  20-22 GiB per node.

@@ -43727,6 +43727,14 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
     /* Resident appends do not pay for an SSD layer sweep. In particular,
      * the server's 128-token mixed quantum must not become scalar prefill. */
     if (!g->streaming && g->tp_world == 1) minimum = 8u;
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* Native ROCm TP kept <256-token appends on the token-major path, which is
+     * ~13 t/s against ~70+ t/s for the batched sweep. The batch pays the 80 ring
+     * gates once per chunk (~90 ms), far less than one gated pass per row, so
+     * short agentic turns belong on the batched path as well. */
+    if (!g->streaming && g->tp_world >= 2 &&
+        !getenv("DS4_ROCM_DISABLE_V41_TP_SMALL_PREFILL")) minimum = 8u;
+#endif
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* With at least half the experts cached, warm short appends beat a full
      * disk sweep. Leave a token-major tail to warm the following decode too. */

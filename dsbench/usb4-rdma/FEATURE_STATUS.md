@@ -1112,3 +1112,61 @@ Ecosystem, read-only:
 Vision PNG (red circle / blue square / CAT 347) correct; two structured tool
 calls; multi-turn KV reuse `cached 929/978`; `NRestarts=0`; zero
 RNR/timeout/desync.
+
+### 2026-11-25 (seventh session) — Avenue 1, Stage 1: implemented, measured, gated off
+
+Implemented the Stage 1 slice exactly as specified: per-row decode compute is
+unchanged (still bit-identical to plain decode), the `count` FFN partials are
+staged into their own batch slices and reduced by **one** batched gate per layer.
+It works and hits the gate target, but it is a **pessimization**, so it ships
+opt-in (`DS4_VERIFY_BATCH_FFN_GATE=1`). Stage 2 was not attempted.
+
+#### What the change does
+
+Inside the `verify_prefix` per-row loop: `ds41_graph_before_moe` (attention plus
+its own gate, unchanged) -> `ds41_moe_partial(..., shared_down=true)` -> copy the
+partial out of the shared single-row `g->tp_out[il*2+FFN]` slot into
+`rows_view[i].block` -> once per layer `ds41_sum_partial_batch(g, active.block,
+il, DS4_TP_GATE_FFN, rows)` -> per row `ds41_bf16(row.block)` then
+`ds41_graph_after_moe`. `DS4_VERIFY_BATCH_FFN_GATE=0` (default) keeps the
+per-row gate.
+
+#### Measured (6-row block, `DS4_VERIFY_PHASE_TIMING=1`)
+
+| config | gates | layers |
+|---|---:|---:|
+| Stage 1 off (default) | **480** (80/row) | **446 ms** |
+| Stage 1 on (FFN batched) | **280** (240 row + 40 batch) | **1700 ms** |
+
+Output is identical in both cases (`We need answer? User just wrote "` on
+`1, 2, 3, 4, 5, 6, 7,`), so the batching is arithmetically sound - it is purely
+a latency regression.
+
+#### Why
+
+The per-row gate and the batch gate are different transport paths. A row gate
+costs **~0.93 ms** (`ds4_gpu_tp_gate_encode` -> the fast single-shot row
+exchange). A batch gate costs **~37 ms** (`ds4_gpu_tp_batch_gate_encode` ->
+`ds4_tp_batch_gate_exchange` -> `tp_rdma_big_gate_exchange`, which posts a
+`tp_rdma_window_barrier` plus a windowed big-gate transfer on every call).
+
+So 40 batched gates cost 1477 ms where the 240 row gates they replace cost
+223 ms - a 40x per-exchange penalty that swamps the 6x fewer exchanges.
+
+#### Consequence for Stage 2
+
+Batching the attention gate would use the same `ds41_sum_partial_batch` path, so
+80 batched gates would cost ~3 s against ~450 ms of row gates: Stage 2 would be
+the same pessimization, and was therefore not attempted.
+
+The real lever is now precise: **make the fast row-gate path carry a multi-row
+payload** (a single post/send pair of `rows * vec_bytes`, no window barrier) so a
+batched gate costs ~1 ms instead of ~37 ms. The slab already has per-slot
+`DS4_TP_BATCH_MAX_ROWS * vec_bytes` buffers, so the storage side exists; what is
+missing is the low-latency exchange entry point. With that, the Stage 1/2
+structure above becomes a clean win (480 -> 80 gates at ~1 ms each, ~446 ->
+~75 ms).
+
+Regression gate on the shipped binary (`ds4` `96f6f14801915b9eacef315340b3e502`):
+Vision correct, two structured tool calls, KV reuse `cached 929/978`,
+`NRestarts=0`, zero RNR/timeout/desync. DSpark remains off in the service.

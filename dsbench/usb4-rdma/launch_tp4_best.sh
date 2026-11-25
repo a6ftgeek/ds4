@@ -20,8 +20,15 @@
 #      BIND (0.0.0.0)     PORT (8000)        RING_PORT (19730)
 #      VISION (1)         VIS_MODEL (V4.1 vision GGUF)
 #      TP_CORE (2)        QP_TIMEOUT (14)    ENVV (extra in-container env)
+#      DSPARK (0)         MTP_MODEL (V4.1 DSpark support GGUF)
+#      DSPARK_CONF ("")   DSPARK_EXACT (0)   DSPARK_STATS (0)
 #      LOGDIR (/tmp/ds4-tp4)                 LOG_MODE (file|journal)
 #      START_TIMEOUT (900 seconds)
+#
+# DSpark is opt-in: DSPARK=1 loads the drafter on ALL four ranks (the verify
+# block is mirrored by every rank) and adds --dspark --mtp-model to each.
+# DSPARK_CONF sets --dspark-confidence (e.g. 0.7), DSPARK_EXACT=1 adds
+# --mtp-exact-sampling, DSPARK_STATS=1 exports DS4_DSPARK_STATS=1.
 #
 # LOG_MODE=journal (set by ds4-tp4.service) leaves the coordinator's stdout on
 # the unit's stdout so journald owns it; otherwise it is redirected to
@@ -46,6 +53,11 @@ START_TIMEOUT=${START_TIMEOUT:-900}
 
 MODEL=${MODEL:-gguf/DeepSeek-V4.1-Flash-Q4.gguf}
 VIS_MODEL=${VIS_MODEL:-gguf/DeepSeek-V4.1-Flash-Vision.gguf}
+DSPARK=${DSPARK:-0}
+MTP_MODEL=${MTP_MODEL:-gguf/DeepSeek-V4.1-Flash-DSpark.gguf}
+DSPARK_CONF=${DSPARK_CONF:-}
+DSPARK_EXACT=${DSPARK_EXACT:-0}
+DSPARK_STATS=${DSPARK_STATS:-0}
 IPS=(192.168.1.101 192.168.1.102 192.168.1.103 192.168.1.104)
 HOSTS=(node1 node2 node3 node4)
 SSH=(ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30)
@@ -56,12 +68,20 @@ for ip in "${IPS[@]}"; do ring+=(--tp-ring-ip "$ip"); done
 vis=()
 if [ "$VISION" = 1 ]; then vis=(--vision "$VIS_MODEL"); fi
 
+spark=()
+if [ "$DSPARK" = 1 ]; then
+    spark=(--dspark --mtp-model "$MTP_MODEL")
+    [ -n "$DSPARK_CONF" ] && spark+=(--dspark-confidence "$DSPARK_CONF")
+    [ "$DSPARK_EXACT" = 1 ] && spark+=(--mtp-exact-sampling)
+fi
+if [ "$DSPARK_STATS" = 1 ]; then ENVV="${ENVV:-} DS4_DSPARK_STATS=1"; fi
+
 container() {  # container <rank> <binary> <extra args...>
     local r=$1 bin=$2; shift 2
     toolbox run -c vllm-gfx1151 -- env USB4_RING_QP_TIMEOUT="$QP_TIMEOUT" ${ENVV:-} \
         "$bin" -m "$MODEL" -c "$CTX" -n "$NTOK" --rocm \
         --tensor-parallel --transport usb4-rdma --tp-world-size 4 "${ring[@]}" \
-        --tp-cpu-core "$TP_CORE" "$@" ${vis[@]+"${vis[@]}"}
+        --tp-cpu-core "$TP_CORE" "$@" ${vis[@]+"${vis[@]}"} ${spark[@]+"${spark[@]}"}
 }
 
 worker_ok() {  # worker_ok <host>
@@ -97,7 +117,7 @@ start_workers() {
     for ((r = 1; r < 4; r++)); do
         h=${HOSTS[$r]}
         setsid "${SSH[@]}" "$h" \
-            "cd \$HOME/dev/ds4-v41-pp/src && setsid nohup env USB4_RING_QP_TIMEOUT=$QP_TIMEOUT ${ENVV:-} toolbox run -c vllm-gfx1151 -- env USB4_RING_QP_TIMEOUT=$QP_TIMEOUT ${ENVV:-} ./ds4 -m $MODEL -c $CTX -n $NTOK --rocm --tensor-parallel --transport usb4-rdma --tp-world-size 4 ${ring[*]} --tp-cpu-core $TP_CORE --role worker --tp-rank $r --coordinator ${IPS[0]} $RING_PORT > /tmp/ds4-tp4_r${r}.log 2>&1 < /dev/null &" \
+            "cd \$HOME/dev/ds4-v41-pp/src && setsid nohup env USB4_RING_QP_TIMEOUT=$QP_TIMEOUT ${ENVV:-} toolbox run -c vllm-gfx1151 -- env USB4_RING_QP_TIMEOUT=$QP_TIMEOUT ${ENVV:-} ./ds4 -m $MODEL -c $CTX -n $NTOK --rocm --tensor-parallel --transport usb4-rdma --tp-world-size 4 ${ring[*]} --tp-cpu-core $TP_CORE ${spark[*]:-} --role worker --tp-rank $r --coordinator ${IPS[0]} $RING_PORT > /tmp/ds4-tp4_r${r}.log 2>&1 < /dev/null &" \
             >/dev/null 2>&1 < /dev/null &
         echo "ds4-tp4: starting rank $r on $h"
     done

@@ -748,3 +748,116 @@ matches**. `systemctl show -p NRestarts ds4-tp4.service` ->
 `NRestarts=0`; `systemctl is-active` -> `active`.
 
 Raw driver: `/tmp/fb/results.json` on node1 (not committed).
+
+# TIER 1 — DSpark speculative decoding at TP=4 (`feat/rocm-tp-perf`)
+
+Worked 2026-11-25 on `feat/rocm-tp-perf` (parent `b90e0b1`), same four nodes,
+`ds41f-q4`, `--transport usb4-rdma`, ranks 0-3. Outcome: the drafter is built,
+verified and wired, but speculative decode is **not a win at TP=4 and stays opt-in
+(`DSPARK=0`)**. Both blockers are measured below.
+
+## 1. The artifact had to be converted, not downloaded
+
+There is no published V4.1 DSpark file: `antirez/deepseek-v4.1-flash-gguf` ships
+only the language GGUFs and the vision encoder, and its README says the weights
+"are not interchangeable with DeepSeek V4 Flash weights or its DSpark drafter".
+Upstream's V4.1 section (`docs/SPECULATIVE_DECODING.md`) says the support file is
+built with `gguf-tools/README.md#convert-v41-dspark`; the converter step is
+`gguf-tools/deepseek41_dspark.py`.
+
+Built from the pinned source `deepseek-ai/DeepSeek-V4.1-Flash` revision
+`df42c109f1defefcbfcedbe7d905718a12266e40`, using only the `mtp.*` shards
+(`model-00044/45/46-of-00048`, 7.4 GiB):
+
+| | |
+|---|---|
+| file | `gguf/DeepSeek-V4.1-Flash-DSpark.gguf` |
+| size | 8,633,942,016 B (**8.04 GiB**, matches upstream) |
+| md5 | `e1a5b6e9ea2a92f257080f970a444011` |
+| audit | `--verify`: all 81 tensor layouts and payloads match the source |
+| metadata | `stages=3 block=5 markov_rank=256 tensors=78 missing=0 invalid=0`, target layers 37-39 |
+
+Copied to all four ranks with matching md5 (rsync, ~590 MB/s).
+
+## 2. Upstream audit: the N-rank verify path already exists
+
+At `b90e0b1` the N-rank work is present (`42809c2`, `02f98a5`): the leader drafts
+locally, every worker mirrors the verify (`ds4_session_tp_spec_cycle` accepts any
+rank > 0 and dispatches `ds41_session_tp_verify`), the commit frame fans out to
+all peers (`tp_peer_send_frame` loops `n_peer`), and worker acks fan in with all
+peers required to agree (`tp_peer_recv_frame`). A verify block is already a
+**single batched forward**: `ds41_dspark_verify` runs `ds41_graph_step_batch` with
+`count` rows. So Tier 1 step 3 is a *measurement* question, not a missing pass.
+
+## 3. Memory: the resident drafter does not fit beside 1M context
+
+Each rank must hold the drafter (the verify is mirrored), +8.10 GiB/rank:
+
+| | no DSpark | DSpark |
+|---|---:|---:|
+| GTT peak (node1) | 101,447 MiB | 108,001 MiB |
+| MemAvailable | 20 GiB | 14 GiB |
+| planned (ctx 896K) | 99.17 GiB | 105.88 GiB |
+
+At `CTX=1048576` the engine refuses admission: `V4.1 needs 110.18 GiB before the
+expert cache; safe budget 109.44 GiB` (the 7/8-RAM rule, `ds41_memory_budget`).
+1M context + vision + the 8.04 GiB drafter is 0.74 GiB over. DSpark therefore runs
+at `CTX=917504` (896K), which fits with margin. This is a config constraint, not
+a defect: the weights themselves fit comfortably in GTT.
+
+## 4. Measurements (matched context 917,504, `--temp 0 -n 128`, one binary)
+
+Alternating arms on the same four nodes; decode t/s is the server's own
+`decoding … avg=` over the request.
+
+| prompt | no DSpark | `--dspark --dspark-confidence 0.7` | delta |
+|---|---:|---:|---:|
+| coding (271 tok) | 5.26 | 5.11 | -2.9% |
+| prose (262 tok) | 4.61 | 4.80 | +4.1% |
+| tool calling (309 tok) | 3.06 | 3.46 | +13.1% |
+| coding, five drafts forced (`--dspark-confidence 0`) | 5.26 | 3.12 | **-41%** |
+
+Acceptance over 32 instrumented cycles: **proposed 160 drafts, accepted 0
+(0.00%)**. Draft cost 60 ms per 5-token proposal; **verify 1.5-4.2 s per 6-row
+block**, against ~78 ms for one ordinary decode token. The +4%/+13% rows are the
+scheduler detecting the loss and backing off to ordinary decode, not a win.
+Tool-calling output was byte-identical in both arms (`text md5 7a3279b7…`).
+
+## 5. Root causes
+
+**A. The drafter's proposals are unrelated to the target (the real blocker).**
+A new probe (`DS4_DSPARK_SPEC_DEBUG=1`) prints the block tokens, the verifier's
+argmax per row and the drafter's own argmax:
+
+```
+t0=89801  t1=14    v0=49489   draft_row0=14
+t0=49489  t1=304   v0=109405  draft_row0=304
+t0=109405 t1=305   v0=109405  draft_row0=305
+```
+
+The verifier is *correct*: its row-0 argmax becomes the next cycle's `t0`
+(49489 → 109405 → 109405), i.e. it predicts the target's actual continuation.
+The drafter proposes a different token every time (14, 304, 305, 463 …) while the
+target continues 109405/127869/33372. So acceptance fails because the V4.1
+drafter's proposals are not aligned with the target on this backend/topology —
+not because of a verify-row offset (that hypothesis was tested and rejected).
+
+**B. A 6-row verify costs 20-54x one decode token.** `ds41_dspark_verify` gates
+the pre-posted small-row window on `g->tp_world == 2`; at world=4 the block runs
+without it and every one of the 80 gates pays the bulk-prefill handshake instead
+of a pre-posted ring exchange. Fix path: port
+`ds4_tp_batch_block_begin_gates`/`ds4_tp_batch_block_end` to the N-rank ring.
+This is worth doing only after (A), because a fast verify of rejected drafts
+still loses.
+
+## 6. Decision
+
+`--dspark` stays **off by default**; `launch_tp4_best.sh` gains opt-in flags:
+
+```sh
+DSPARK=1 CTX=917504 DSPARK_CONF=0.7 DSPARK_STATS=1 bash launch_tp4_best.sh start
+# DSPARK_EXACT=1 adds --mtp-exact-sampling; MTP_MODEL overrides the support file
+```
+
+The flags are applied to **all four ranks** (the verify is mirrored by every
+rank). Baseline configuration and performance are unchanged.

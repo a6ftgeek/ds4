@@ -88684,6 +88684,19 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, count - 1u);
     }
     if (!ds41_session_verify(s, tokens, count)) goto fail;
+    if (getenv("DS4_DSPARK_SPEC_DEBUG")) {
+        /* Phase-1 probe: are the drafts rejected because the verifier's rows
+         * are offset, or because the drafter's proposals are unrelated? */
+        const int v0 = sample_argmax(d->host_verified, DS4_N_VOCAB);
+        const int v1 = count > 2 ? sample_argmax(d->host_verified + DS4_N_VOCAB, DS4_N_VOCAB) : -1;
+        const int v2 = count > 3 ? sample_argmax(d->host_verified + 2 * DS4_N_VOCAB, DS4_N_VOCAB) : -1;
+        const int dl = d->host_logits ? sample_argmax(d->host_logits, DS4_N_VOCAB) : -1;
+        fprintf(stderr,
+                "ds4: DSPARK_DBG count=%u t0=%d t1=%d t2=%d t3=%d | v0=%d v1=%d v2=%d | draft_row0=%d\n",
+                count, tokens[0], count > 1 ? tokens[1] : -1,
+                count > 2 ? tokens[2] : -1, count > 3 ? tokens[3] : -1,
+                v0, v1, v2, dl);
+    }
     uint32_t keep = 1;
     int correction = -1;
     for (; keep < count; keep++) {

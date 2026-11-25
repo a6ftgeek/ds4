@@ -1542,3 +1542,116 @@ over the block's rows (one payload of `rows` rows per layer) does not change any
 row's arithmetic — so per-row compute + one batched exchange per layer should
 take 480 exchanges back to 80 while keeping bit-identical logits. That is the
 next step, not a numerical compromise.
+
+### 2026-11-25 (sixth session) — avenues 1-5: measured ceilings, no code change
+
+Starting from `5b83d79`. Nothing in this session warranted a code change, so the
+shipped binary is unchanged (`ds4` `39704dbbc86e56a62171569baf1fe1d9`); the
+service was healthy throughout (`NRestarts=0`, no ring errors) and the close-out
+sweep below re-confirms it.
+
+#### Avenue 1 — batching the verify gate exchange: analysis, not implemented
+
+Measured baseline (`DS4_VERIFY_PHASE_TIMING=1`): a 6-row block fires
+**480 gates (80 per row) at 0.93 ms each = 446 ms**, which is the entire block
+cost (`setup=0.3 ms`, `layers=446 ms`, `rest=0.0 ms`).
+
+The intended refactor is to keep the per-row decode compute (bit-identical, see
+`75f5613`) and batch only the exchange, since a gate is a per-row all-reduce and
+one payload of `rows` rows leaves every row's arithmetic unchanged. The code
+audit shows what that costs: the gate lives *inside* `ds41_attention_expand`
+(attention, `ds4.c:42130`) and `ds41_moe_finish` (`ds4.c:42719`), so batching
+requires splitting both into gated/ungated phases plus per-row destination
+buffers, because `ds41_moe_partial` writes its partial into the single-row
+`g->tp_out[il*2+FFN]` slot when the slab gate is active. The partial/finish split
+already exists (`ds41_moe_partial` / `ds41_moe_finish`, used by the TP=2 decode
+island), so the work is contained but not small: four phase boundaries per layer,
+two new "finish without gate" paths, and the engram/`engram_rows_b` row-offset
+handling has to stay correct across the split.
+
+Expected outcome per the phase order: FFN-only batching gives 280 gates
+(40 layers x 1 + 40 layers x 6), both gates batched gives 80. At 0.93 ms/gate
+that is 446 -> ~260 ms -> ~75 ms per block, which is what would put a
+5-accepted-token block under the plain-decode cost. Not attempted this session,
+because a half-finished split in the verify path risks the correctness that
+`75f5613` just established.
+
+#### Avenue 2 — per-gate latency: the link is already at its ceiling
+
+**Every USB4 port on all four nodes reports `10.0 Gb/s x 2 lanes`**
+(`/sys/bus/thunderbolt/devices/*/rx_speed`, `tx_speed`), not the 20 Gb/s x 2 the
+avenue hoped for. That matches the bring-up note in
+`dsbench/usb4-rdma/readiness.md`: without the H2H enhancement each DMA path is
+capped near 10 Gb/s. So 2.5 GB/s per link is the hardware ceiling here, and
+0.93 ms per gate is consistent with a ring round trip at that rate plus CQ
+wait/wakeup; there is no down-trained link to fix.
+
+OS/transport state is already tuned: `thunderbolt_ibverbs` runs
+`profile=linux_perf bind_services=Y allocate_rings=Y start_rings=Y`, and the CPU
+is `amd_pstate=active` with governor `performance`.
+
+Two parameters differ from the published multi-port tuning
+([pleite/thunderbolt-ibverbs MULTI-PORT-TOPOLOGY](https://raw.githubusercontent.com/pleite/thunderbolt-ibverbs/refs/heads/main/docs/MULTI-PORT-TOPOLOGY.md)):
+`native_fragment_striping=N` (guide suggests `1`) and `zcopy_min_bytes=0`
+(guide suggests `4096`). Both are bandwidth/striping knobs rather than latency
+knobs, so they would target prefill, and changing them needs a module reload that
+tears down the ring for all four nodes - a maintenance-window item, not something
+to do under a serving stack.
+
+#### Avenue 3 — pipeline parallelism: not implemented
+
+`--pp`, `--pipeline`, `pp_stage`, `pp_world` and `DS4_PP` do not exist anywhere
+in the tree (0 symbols). Per the instruction, confirmed and moved on; there is no
+TP=4 vs PP=4 A/B to run.
+
+#### Avenue 4 — multi-slot KV checkpoints: single live slot today
+
+Measured A -> B -> A with two different 4K documents:
+
+```
+A1: wall=39.77s prompt=3061 cached=0
+B : wall=12.67s prompt= 809 cached=0
+A2: wall=39.50s prompt=3061 cached=0    <- returning to A re-prefills everything
+```
+
+So the engine keeps exactly one live KV checkpoint (the last conversation) and
+reuse only works when a prompt *extends* it - which is the 95% reuse already
+measured inside one conversation. `slot_count` in `ds4_server.c` is server
+concurrency (concurrent sessions), not retained prefix checkpoints. Multi-slot
+warm prefixes would need engine-level work (one checkpointed session graph per
+slot), not a flag; at ~5.5 GiB KV per 4K slot inside a 20 GiB `MemAvailable`
+budget, two extra slots might fit, but that is a design change.
+
+#### Avenue 5 — upstream and ecosystem delta
+
+`git fetch origin` (read-only) shows **0 commits** on `antirez/ds4` beyond
+`b90e0b1`; nothing to cherry-pick.
+
+Ecosystem, read-only:
+* [Shoestring-dev/StrixFold](https://upstar.dev/r/Shoestring-dev/StrixFold) is a
+  Zig port of TensorFold running V4.1-Flash across **two** Strix Halo boxes. Its
+  HIP/Strix Halo kernels are interesting but its topology is 2-node, so it does
+  not map onto our 4-node TP=4 ring.
+* The [multi-port topology guide](https://raw.githubusercontent.com/pleite/thunderbolt-ibverbs/refs/heads/main/docs/MULTI-PORT-TOPOLOGY.md)
+  is the source of the two module params above.
+* Sven's thunderbolt fixes ("lost ring interrupts" and an XDomain use-after-free,
+  found between two Strix Halo hosts running an out-of-tree USB4 service driver)
+  are candidates for the host kernel
+  ([patch](https://patchew.org/linux/1794520303-5758-1-git-send-email-sven-kernel@sven.de/)).
+* Strix Halo system tuning (ODS) recommends the `performance` governor and
+  disabling idle states for 5-8% prompt processing; the governor is already
+  `performance`.
+
+#### Close-out sweep (unchanged binary, plain decode, DSpark off)
+
+| context | prompt tok | prefill | TTFT | decode | needle |
+|---|---:|---:|---:|---:|---|
+| short | 124 | 64.75 t/s | 1.92 s | — | — |
+| short | 229 | 67.40 t/s | 3.40 s | — | — |
+| 4K | 3061 | 79.69 t/s | 38.42 s | 13.41 t/s | recalled |
+| 16K | 11843 | 126.50 t/s | 93.63 s | 13.18 t/s | recalled |
+| 64K | 44781 | 144.06 t/s | 310.86 s | 12.86 t/s | recalled |
+
+Vision PNG (red circle / blue square / CAT 347) correct; two structured tool
+calls; multi-turn KV reuse `cached 929/978`; `NRestarts=0`; zero
+RNR/timeout/desync.

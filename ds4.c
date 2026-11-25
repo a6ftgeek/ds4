@@ -41892,6 +41892,9 @@ static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                                    uint32_t il, uint32_t gate, uint32_t count) {
     if (g->tp_world < 2) return true;
     const uint64_t bytes = (uint64_t)count * DS4_N_EMBD * sizeof(float);
+    /* Routing the world>2 verify block through the bulk gate instead of these
+     * slots was tried and reverted: the verify logits were byte-identical, so
+     * the verifier's wrongness is not in the gate exchange. */
     if (g->verify_prefix) {
         const uint32_t slot = il * DS4_TP_BATCH_GATES_PER_LAYER + gate;
         if (!g->tp_batch_out || !g->tp_batch_in || count > DS4_TP_BATCH_MAX_ROWS ||

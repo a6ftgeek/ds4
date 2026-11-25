@@ -1469,3 +1469,76 @@ residual, pre-head norm). Everything above is consistent with the verify rows
 being evaluated against a KV window that differs from the decode window; that
 comparison is the shortest path to the fix, and it no longer needs the drafter in
 the loop at all — the drafter already proposes the right token.
+
+### 2026-11-25 (fifth session) — layer-by-layer bisect: verify_prefix corruption found and fixed
+
+DSpark stays **off** (speed gate not met), but the correctness bug is now
+identified, fixed and measured. `ds4` `243ae576e013e15a8971cd205cf9fd55` plus the
+gate counter.
+
+#### Harness
+
+`DS4_BISECT_DUMP=1` prints, per layer, `sum`, `l2`, `max_abs` and the first four
+floats of one row's post-attention tensor (`after_attn`, where the attention
+output lives at TP>=2) and post-FFN residual. Comparing one 2-row verify block
+(`DS4_DSPARK_VERIFY_CAP=1`) against two single-token decode steps of the same
+prompt and tokens (`1, 2, 3, 4, 5, 6, 7,` -> `We`, ` need`).
+
+Harness validation: the ordinary decode step that precedes the block is
+byte-identical in both runs (`dsum=0`, `dl2=0` through layer 39), so the two
+sessions really do share a starting state.
+
+#### Result: row 0, verify block vs decode step 1
+
+| stage | il | reference | verify | dsum | dl2 |
+|---|---:|---:|---:|---:|---:|
+| pre-layer0 | 0 | 28.034391 | 28.034391 | 0 | 0 |
+| post-attn | 0 | 18.688898 | 18.691813 | **2.9e-3** | **4.8e-3** |
+| post-attn | 1 | 0.342505 | 0.352706 | 1.0e-2 | 6.9e-2 |
+| post-attn | 2 | 14.178909 | 14.069027 | 0.11 | 5.5e-3 |
+| post-attn | 3 | 32.844519 | 38.046677 | 5.2 | 171.8 |
+| post-attn | 4 | 45.196963 | 84.943732 | 39.7 | 1073 |
+
+Row 1 behaves identically (first divergence also at layer-0 post-attention,
+dsum 1.0e-2). The input embeddings are exact, so the block starts from the right
+state.
+
+**Interpretation.** The first divergence is a ~1.6e-4 *relative* difference at
+layer 0, i.e. a floating-point reduction-order difference between the batched
+verify projections and the single-token decode kernels — not a layout or
+position bug. The model then amplifies it ~50x per layer from layer 3 onwards,
+which is the MoE router flipping experts on near-boundary logits. By mid-stack
+the verified trajectory is unrelated to the target's, so the verifier's argmax
+is garbage and every correct draft is rejected. That is exactly the 0/160
+acceptance and the "Wearelli是非..." output.
+
+#### Fix
+
+Each verify row now runs through the *exact* decode layer
+(`ds41_graph_layer`) inside the block, so verified logits are bit-identical to
+single-token decode. `DS4_VERIFY_BATCHED_LAYER=1` restores the old batched
+pipeline for A/B.
+
+| | before | after |
+|---|---|---|
+| output on the counting prompt | `Wearelli是非 main oj oj` | `We need answer?` (identical to plain decode) |
+| acceptance | 0/160 (0%) | up to **4/4** on a block (observed 4/4, 4/2, 1/1) |
+| verify block latency | 1.5-4.2 s | **250-540 ms** |
+| net decode, 4K prompt | — | 7.87 t/s vs 12.72 plain |
+| net decode, 896K short prompts | — | 4.47 / 4.77 / 4.00 vs 5.26 / 4.61 / 3.06 plain |
+
+Phase timing (`DS4_VERIFY_PHASE_TIMING=1`) attributes the whole block to the
+layer sweep, with a ring-gate counter: `setup=0.4 ms layers=445-540 ms
+rest=0.0 ms` for a 6-row block — 40 layers x 6 rows of decode-path gates, i.e.
+480 exchanges instead of 80.
+
+#### Verdict and next step
+
+DSpark still **loses** (7.87 vs 12.72 t/s at 4K) and stays **off**: the gate is
+"faster than plain decode and 100% stable", and it is not faster yet. The
+correctness blocker is gone, though, and the remaining gap is purely the
+exchange count. Because a gate is a per-row all-reduce, batching the *exchange*
+over the block's rows (one payload of `rows` rows per layer) does not change any
+row's arithmetic — so per-row compute + one batched exchange per layer should
+take 480 exchanges back to 80 while keeping bit-identical logits. That is the
+next step, not a numerical compromise.

@@ -41814,9 +41814,14 @@ static uint32_t ds41_tp_expert_count(const ds41_gpu_graph *g, uint32_t n_total) 
     return count;
 }
 
+/* Verify-phase accounting (DS4_VERIFY_PHASE_TIMING=1): how many ring gate
+ * exchanges a block performs and where its wall time goes. */
+static uint64_t g_ds41_gate_count;
+
 static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                              uint32_t il, uint32_t gate) {
     if (g->tp_world < 2) return true;
+    g_ds41_gate_count++;
     const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + gate;
     /* the producers write their partial into the slot unless the slab write is off */
     if ((ds41_tp_slab_off() && !ds4_gpu_tensor_copy(g->tp_out[slot], 0, x, 0, (uint64_t)DS4_N_EMBD * 4u)) ||
@@ -41891,6 +41896,7 @@ static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                                    uint32_t il, uint32_t gate, uint32_t count) {
     if (g->tp_world < 2) return true;
+    g_ds41_gate_count++;
     const uint64_t bytes = (uint64_t)count * DS4_N_EMBD * sizeof(float);
     /* Routing the world>2 verify block through the bulk gate instead of these
      * slots was tried and reverted: the verify logits were byte-identical, so
@@ -42968,10 +42974,43 @@ static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
         ds41_hc_mix(g, m, l, true, g->attn_split);
 }
 
+/* Bisect harness (DS4_BISECT_DUMP=1): per-layer checksums of the residual for
+ * one row, so a 2-row verify block can be compared against two single-token
+ * decode steps stage by stage. Every rank dumps, so the device reads keep the
+ * ring lockstep. */
+static void ds41_bisect_dump(const char *tag, int il, int row,
+                             const ds4_gpu_tensor *t, uint64_t row_floats) {
+    if (!getenv("DS4_BISECT_DUMP") || !t || row < 0 || !row_floats) return;
+    const uint64_t bytes = row_floats * sizeof(float);
+    float *buf = malloc(bytes);
+    if (!buf) return;
+    if (!ds4_gpu_tensor_read(t, (uint64_t)row * bytes, buf, bytes)) {
+        free(buf);
+        return;
+    }
+    double sum = 0.0, l2 = 0.0;
+    float mx = 0.0f;
+    for (uint64_t i = 0; i < row_floats; i++) {
+        const float v = buf[i];
+        sum += v;
+        l2 += (double)v * v;
+        if (fabsf(v) > mx) mx = fabsf(v);
+    }
+    fprintf(stderr, "BISECT %s il=%d row=%d sum=%.6f l2=%.6f max=%.6f f4=%.5f,%.5f,%.5f,%.5f\n",
+            tag, il, row, sum, l2, mx, buf[0], buf[1], buf[2], buf[3]);
+    free(buf);
+}
+
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t il) {
-    return ds41_graph_before_attention(g, m, l, il) && ds41_attention(g, m, l, il, false) &&
+    if (il == 0) ds41_bisect_dump("pre-layer0", 0, 0, g->residual,
+                                  (uint64_t)DS4_N_HC * DS4_N_EMBD);
+    const bool ok = ds41_graph_before_attention(g, m, l, il) &&
+        ds41_attention(g, m, l, il, false) &&
         (g->tp_world >= 2 ? ds41_graph_after_attention(g, m, l, il) : ds41_hc_mix(g, m, l, true, g->attn_split));
+    if (ok) ds41_bisect_dump("post-attn1", (int)il, 0, g->after_attn,
+                             (uint64_t)DS4_N_HC * DS4_N_EMBD);
+    return ok;
 }
 
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
@@ -43349,8 +43388,11 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
+    const bool ok = ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
         ds41_graph_after_moe(g, m, l, il, il + 1u == DS4_N_LAYER);
+    if (ok) ds41_bisect_dump("post-ffn1", (int)il, 0, g->residual,
+                             (uint64_t)DS4_N_HC * DS4_N_EMBD);
+    return ok;
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -44495,6 +44537,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const bool shared_owner = g->tp_world >= 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds41_prefill_row active = {0};
+    const bool vt = g->verify_prefix && getenv("DS4_VERIFY_PHASE_TIMING") != NULL;
+    double vt_t0 = 0.0, vt_start = 0.0, vt_setup = 0.0, vt_layers = 0.0;
+    const uint64_t vt_g0 = g_ds41_gate_count;
+    if (vt) { (void)ds4_gpu_flush_commands(); vt_start = vt_t0 = now_sec(); }
+#define DS41_VT_END(acc) do { if (vt) { (void)ds4_gpu_flush_commands(); \
+    (acc) += (now_sec() - vt_t0) * 1000.0; } } while (0)
     ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
     uint32_t positions[DS4_TP_BATCH_MAX_ROWS];
     /* Consecutive prompt or verifier rows may share a session. Keep their
@@ -44556,6 +44604,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     const uint32_t flush_layers = ds41_decode_flush_layers();
     uint32_t il = 0;
+    DS41_VT_END(vt_setup);
+    if (vt) { (void)ds4_gpu_flush_commands(); vt_t0 = now_sec(); }
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
         if (ds41_engram_layer(il)) {
@@ -44575,10 +44625,37 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     sizeof(s->rows[table]));
             }
         }
+        /* The batched verify pipeline is numerically different from
+         * single-token decode: a bisect of one 2-row block against two decode
+         * steps showed the first divergence at layer-0 post-attention
+         * (dsum 2.9e-3 on a sum of 18.7), and the MoE then amplified it ~50x
+         * per layer from layer 3 on, so the block produced logits unrelated to
+         * the target and rejected every draft. Each verify row therefore runs
+         * through the exact decode layer, which is bit-identical to decode.
+         * DS4_VERIFY_BATCHED_LAYER restores the old batched pipeline for A/B. */
+        if (ok && g->verify_prefix && !getenv("DS4_VERIFY_BATCHED_LAYER")) {
+            for (int i = 0; ok && i < count; i++) {
+                ds41_gpu_graph row = *graphs[i];
+                row.pos = positions[i];
+#define DS41_BISECT_ROW_VIEW(name, width) row.name = g->rows_view[i].name;
+                DS41_PREFILL_ROWS(DS41_BISECT_ROW_VIEW)
+#undef DS41_BISECT_ROW_VIEW
+                ok = ds41_graph_layer(&row, model, &weights->layer[il], il, tokens[i]);
+            }
+            if (!ok) break;
+            continue;
+        }
         for (int i = 0; ok && i < count; i++)
             ok = ds41_dspark_capture(graphs[i]->dspark, il, positions[i],
                 g->rows_view[i].residual, 1);
         if (ok) {
+            if (il == 0) {
+                ds41_bisect_dump("pre-layer0N", 0, 0, active.residual,
+                                 (uint64_t)DS4_N_HC * DS4_N_EMBD);
+                if (rows > 1u)
+                    ds41_bisect_dump("pre-layer0N", 0, 1, active.residual,
+                                     (uint64_t)DS4_N_HC * DS4_N_EMBD);
+            }
             ds4_gpu_tensor *saved_engram = active.engram_rows;
             if (il == 14) active.engram_rows = g->engram_rows_b;
             ok = ds41_before_attention_batch(g, &active, model, l, il, rows);
@@ -44639,8 +44716,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     l->attn_output_b->abs_offset, g->batch.heads, rows);
         if (ok && !expanded) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows) &&
             ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16);
-        if (ok) ok = ds41_after_attention_batch(&active, model, l, rows, expanded) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner, !expanded) &&
+        if (ok) ok = ds41_after_attention_batch(&active, model, l, rows, expanded);
+        if (ok) {
+            ds41_bisect_dump("post-attnN", (int)il, 0, active.after_attn,
+                             (uint64_t)DS4_N_HC * DS4_N_EMBD);
+            if (rows > 1u)
+                ds41_bisect_dump("post-attnN", (int)il, 1, active.after_attn,
+                                 (uint64_t)DS4_N_HC * DS4_N_EMBD);
+        }
+        if (ok) ok = ds41_moe_batch(g, model, l, il, rows, shared_owner, !expanded) &&
             (expanded ? ds41_moe_expand_batch(&active, model, l, rows) :
              ((shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                   (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
@@ -44649,6 +44733,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
               ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                   active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
               ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16)));
+        if (ok) {
+            ds41_bisect_dump("post-ffnN", (int)il, 0, active.residual,
+                             (uint64_t)DS4_N_HC * DS4_N_EMBD);
+            if (rows > 1u)
+                ds41_bisect_dump("post-ffnN", (int)il, 1, active.residual,
+                                 (uint64_t)DS4_N_HC * DS4_N_EMBD);
+        }
         /* Each Engram table owns its row buffer. Only the TP gates need the layer-13 drain. */
         if (ok && il == 13 && g->tp_world >= 2) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
         else if (ok && batch_queue && il + 1u < DS4_N_LAYER && flush_layers &&
@@ -44698,6 +44789,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     for (int i = 0; i < count; i++) {
         ds4_gpu_tensor_free(queries[i]);
         ds4_gpu_tensor_free(heads[i]);
+    }
+    DS41_VT_END(vt_layers);
+    if (vt) {
+        const double total = (now_sec() - vt_start) * 1000.0;
+        fprintf(stderr,
+                "ds4: VERIFY_PHASE rows=%d layers=%u gates=%llu setup=%.1f "
+                "layers=%.1f rest=%.1f total=%.1f ms\n",
+                count, il,
+                (unsigned long long)(g_ds41_gate_count - vt_g0),
+                vt_setup, vt_layers, total - vt_setup - vt_layers, total);
     }
     free(engram);
     return ok;

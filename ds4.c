@@ -44540,6 +44540,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const bool vt = g->verify_prefix && getenv("DS4_VERIFY_PHASE_TIMING") != NULL;
     double vt_t0 = 0.0, vt_start = 0.0, vt_setup = 0.0, vt_layers = 0.0;
     const uint64_t vt_g0 = g_ds41_gate_count;
+    /* Fast verify window: one pre-posted receive window covers the whole block,
+     * so each batched gate is a send+drain instead of post+barrier+transfer. */
+    const char *ffn_env = getenv("DS4_VERIFY_BATCH_FFN_GATE");
+    const bool verify_ffn_batch = ffn_env && ffn_env[0] == '1';
+    const char *fast_env = getenv("DS4_VERIFY_FAST_BATCH_GATE");
+    const bool verify_fast_window = verify_ffn_batch && g->verify_prefix &&
+        g->tp_world > 2 && g_tp_block_ctx != NULL &&
+        (!fast_env || fast_env[0] != '0');
+    bool verify_window_open = false;
     if (vt) { (void)ds4_gpu_flush_commands(); vt_start = vt_t0 = now_sec(); }
 #define DS41_VT_END(acc) do { if (vt) { (void)ds4_gpu_flush_commands(); \
     (acc) += (now_sec() - vt_t0) * 1000.0; } } while (0)
@@ -44605,6 +44614,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const uint32_t flush_layers = ds41_decode_flush_layers();
     uint32_t il = 0;
     DS41_VT_END(vt_setup);
+    if (ok && verify_fast_window) {
+        uint32_t gates = 1;
+        verify_window_open = ds4_tp_batch_block_begin_slots(g_tp_block_ctx, rows,
+            DS4_N_LAYER, DS4_TP_GATE_FFN, DS4_TP_GATES_PER_LAYER, &gates) && gates == 1;
+        if (!verify_window_open)
+            fprintf(stderr, "ds4: verify fast batch window unavailable; using the barrier gate\n");
+    }
     if (vt) { (void)ds4_gpu_flush_commands(); vt_t0 = now_sec(); }
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
@@ -44648,8 +44664,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
              * 1477 ms where the 240 row gates they replace are 223 ms. This
              * stays opt-in until the transport can carry a multi-row payload
              * on the fast row path. */
-            const char *ffn_opt = getenv("DS4_VERIFY_BATCH_FFN_GATE");
-            const bool batch_ffn = ffn_opt && ffn_opt[0] == '1';
+            const bool batch_ffn = verify_ffn_batch;
             const uint32_t ffn_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
             const bool stage = batch_ffn && g->tp_out && !ds41_tp_slab_off();
             for (int i = 0; ok && i < count; i++) {
@@ -44783,6 +44798,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         else if (ok && batch_queue && il + 1u < DS4_N_LAYER && flush_layers &&
                  (il == 0 || (il + 1u) % flush_layers == 0))
             ok = ds4_gpu_flush_commands() != 0;
+    }
+    if (verify_window_open) {
+        if (!ds4_tp_batch_block_end(g_tp_block_ctx)) ok = false;
+        verify_window_open = false;
     }
     for (int i = 0; i < count; i++)   /* a failure before layer 1 */
         for (unsigned t = 0; t < 2; t++) if (reads[i][t]) ds4_engram_read_batch_finish(reads[i][t]);

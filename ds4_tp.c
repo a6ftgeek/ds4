@@ -225,6 +225,11 @@ typedef struct {
     uint32_t block_rows;
     uint32_t block_layers;
     uint32_t block_posted;      /* layers whose receives are posted */
+    /* A block may cover every Nth gate slot (e.g. FFN only): slot0 is the
+     * first slab slot and slot_step the stride between gates. 0/1 keeps the
+     * two-rank verify block unchanged. */
+    uint32_t block_slot0;
+    uint32_t block_slot_step;
     uint64_t block_recv_done;   /* row messages received in this block */
     /* Command mailbox and begin records (both peers offered them). */
     bool mbox_active;
@@ -2243,8 +2248,9 @@ static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
     struct ibv_sge *sge = r->win_sge;
     struct ibv_recv_wr *wr = r->win_rwr;
     memset(wr, 0, (size_t)n * sizeof(*wr));
+    const uint32_t slot = r->block_slot0 + layer * (r->block_slot_step ? r->block_slot_step : 1u);
     const uintptr_t base =
-        (uintptr_t)(tp->slab + ds4_tp_slab_batch_in_offset(tp, layer));
+        (uintptr_t)(tp->slab + ds4_tp_slab_batch_in_offset(tp, slot));
     uint32_t wi = 0;
     for (uint32_t row = 0; row < rows; row++) {
         for (uint64_t off = 0; off < tp->vec_bytes; ) {
@@ -2273,9 +2279,15 @@ static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
     return 1;
 }
 
-static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows) {
+static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t slot, uint32_t rows) {
     ds4_tp_rdma *r = &tp->rdma;
+    /* `slot` is the gate's slab slot (what the GPU layer passes); the block's
+     * ordinal follows from it, so a block can cover every second slot while
+     * the per-gate ordering rule stays the same. */
+    const uint32_t step = r->block_slot_step ? r->block_slot_step : 1u;
+    const uint32_t layer = slot >= r->block_slot0 ? (slot - r->block_slot0) / step : UINT32_MAX;
     if (!r->block_active || rows != r->block_rows || layer >= r->block_layers ||
+        slot != r->block_slot0 + layer * step ||
         layer + 1u != r->block_posted) {
         fprintf(stderr, "ds4-tp: verify-block gate out of order (layer %u rows %u, posted %u/%u rows %u)\n",
                 layer, rows, r->block_posted, r->block_layers, r->block_rows);
@@ -2297,7 +2309,7 @@ static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows
         if (ok) {
             memset(wr, 0, (size_t)n * sizeof(*wr));
             const uintptr_t base =
-                (uintptr_t)(tp->slab + ds4_tp_slab_batch_out_offset(tp, layer));
+                (uintptr_t)(tp->slab + ds4_tp_slab_batch_out_offset(tp, slot));
             uint32_t wi = 0;
             for (uint32_t row = 0; row < rows; row++) {
                 for (uint64_t off = 0; off < tp->vec_bytes; ) {
@@ -3390,6 +3402,7 @@ int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
 
 int ds4_tp_batch_block_begin_gates(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
                                   uint32_t *gates_per_layer) {
+    if (tp) { tp->rdma.block_slot0 = 0; tp->rdma.block_slot_step = 1; }
     if (!tp || ds4_tp_failed(tp) || !gates_per_layer || *gates_per_layer < 1 ||
         *gates_per_layer > DS4_TP_BATCH_GATES_PER_LAYER ||
         rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS || n_layers == 0 ||
@@ -3449,6 +3462,17 @@ int ds4_tp_batch_block_begin_gates(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
     if (window) r->block_layers = n_layers * *gates_per_layer;
 #endif
     return 1;
+}
+
+/* Verify block over a strided slot set (FFN-only batching): slot0/step map the
+ * block ordinal to the slab slot the GPU layer uses. */
+int ds4_tp_batch_block_begin_slots(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
+                                   uint32_t slot0, uint32_t slot_step,
+                                   uint32_t *gates_per_layer) {
+    if (!tp) return 0;
+    tp->rdma.block_slot0 = slot0;
+    tp->rdma.block_slot_step = slot_step ? slot_step : 1u;
+    return ds4_tp_batch_block_begin_gates(tp, rows, n_layers, gates_per_layer);
 }
 
 /* End of the verify block: every gate must have been exchanged (all

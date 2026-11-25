@@ -170,6 +170,11 @@ int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers);
  * gate indices, not layer indices. Works with RDMA and TCP. */
 int ds4_tp_batch_block_begin_gates(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
                                   uint32_t *gates_per_layer);
+/* Same block, but over a strided slot set: slot0 is the first gate slot and
+ * slot_step the stride (e.g. 1/2 for FFN-only batching). */
+int ds4_tp_batch_block_begin_slots(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
+                                   uint32_t slot0, uint32_t slot_step,
+                                   uint32_t *gates_per_layer);
 int ds4_tp_batch_block_end(ds4_tp *tp);
 
 /* Prefill batch gate: arbitrary-size symmetric payload exchange over bulk

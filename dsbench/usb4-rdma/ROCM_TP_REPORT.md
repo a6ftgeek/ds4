@@ -1400,3 +1400,72 @@ hypotheses pointed:
 The Markov head is a third, independent defect: the converted bias is 5-10x the
 base distribution's spread, which is worth revisiting against the upstream
 converter's intended scaling even after the verify is fixed.
+
+### 2026-11-25 (fourth session) — the drafter is correct; the verifier is not
+
+Continues the Step 1/2 isolation. DSpark remains **off**; the default path is
+unchanged. `ds4` `978c1fee902b88e343ead95fcd84814c`, `ds4-server`
+`62350363466930ed72f124fb6f6d62c4`, identical on all four ranks, service
+healthy (`NRestarts=0`, no ring errors).
+
+#### The decisive observation
+
+The first speculative block of a fresh session on `"1, 2, 3, 4, 5, 6, 7,"`,
+`--temp 0`, confidence 0:
+
+```
+DSPARK_DBG count=6 | t0=2581 'We'  t1=1309 ' need'  t2=3287 ' answer'
+DSPARK_DBG        | v0=112763 'arelli'  v1=127869 ' pronto'  | draft0=1309 ' need'
+```
+
+* `draft0 = 1309 ' need'` is **exactly** what plain decode produces after
+  `We` ("We need answer?") — **the drafter's proposal is correct**.
+* `v0 = 112763 'arelli'` is the verifier's row-0 argmax — **the target's own
+  verification logits are wrong**.
+
+So acceptance is 0 because the *verifier* rejects a correct draft. The drafter,
+its capture/seed path and the Markov head are not the acceptance blocker (the
+Markov bias does add up to +15 on the top token but it did not change the
+argmax here).
+
+The corrupted verify state is not random: it is prompt-dependent and degrades
+into repetition, which is the signature of a wrong KV/position state rather than
+a stale buffer:
+
+| prompt | verify output |
+|---|---|
+| `1, 2, 3, 4, 5, 6, 7,` | `Wearelli是非 main oj oj constructive constructive` |
+| `Write a haiku about the sea.` | `We tonal tones tonesfgfgfgfg` |
+| `What is 17*23?` | `We answering answeringansw Expl expl` |
+
+Because `keep=1` commits `argmax(verified row 0)` every cycle, the server emits
+the verifier's wrong logits — which is why enabling DSpark degraded the whole
+response, not just the speculative part.
+
+#### Ruled out by direct A/B (each produced byte-identical output)
+
+| hypothesis | test | result |
+|---|---|---|
+| verify gate exchange (slot vs bulk) | route world>2 verify through `ds4_gpu_tp_big_gate_encode` | identical |
+| attention selector (per-row vs batched) | `batch_attention` enabled for verify | **worse**: BOS loop, verify still 1.6-2.5 s |
+| N-rank batch pipeline / mid-loop device sync | `DS4_METAL_DISABLE_V41_BATCH_DECODE_PIPELINE=1` | identical |
+| batched output head (only verify uses it; prefill heads one row per-row) | `DS4_METAL_DISABLE_V41_BATCH_HEAD=1` | identical |
+| stale/uninitialised buffer | three different prompts | prompt-dependent, so no |
+| draft broadcast divergence / expert sharding | earlier sessions | ruled out / fixed |
+
+#### Verify cost, restated
+
+`batch_attention` is Apple-only (`ds4.c:44587`), so a 6-row verify runs the whole
+single-token graph once per row: **480 ring gates per block instead of 80**.
+Enablement attempts above did not reduce the time, so the per-row path is doing
+more than the gate count suggests (each row also re-runs the layer's
+`ds41_before_attention`/publish work).
+
+#### Next step, precisely
+
+The verifier's row-0 logits must be compared against one ordinary decode step at
+the same position, with per-stage dumps (post-attention residual, post-FFN
+residual, pre-head norm). Everything above is consistent with the verify rows
+being evaluated against a KV window that differs from the decode window; that
+comparison is the shortest path to the fix, and it no longer needs the drafter in
+the loop at all — the drafter already proposes the right token.

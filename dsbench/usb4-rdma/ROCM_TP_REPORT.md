@@ -966,3 +966,91 @@ the measurement recorded here.
   coordinator or any worker log.
 * GTT 101,427 MiB (node1) / 100,515 / 100,515 / 100,501 MiB; MemAvailable
   20-22 GiB per node.
+
+# TIER 3 — decode compute: audit and why no code changed
+
+Worked 2026-11-25 on `feat/rocm-tp-perf` after Tier 2. Outcome: **nothing was
+changed**, and this section records the measurements that justify it. Both of
+Tier 3's items are bounded by the share of decode time that is compute at all.
+
+## 1. The budget: decode is ring-bound, not compute-bound
+
+The measured decode rates on this stack are 12.46 t/s at 4K and 12.09 t/s at
+64K (82.6 ms/token). The two per-layer ring gates are strictly serial with the
+compute (`attn out -> DS4_TP_GATE_ATTN -> FFN -> DS4_TP_GATE_FFN -> next layer`,
+`ds4.c:26002` and `ds4.c:27748`), i.e. 80 round trips per token. At the
+~0.9-1.1 ms per exchange measured at `b90e0b1` that is 72-88 ms of the 82.6 ms
+token: the report's own A/B split stands (**~84% ring, ~16% compute+head**).
+
+Everything Tier 3 can touch lives inside that ~16%, and host launch overhead is
+a fraction of it. That is the ceiling for the whole tier: **<=1.19x decode**,
+and realistically a few percent.
+
+## 2. Per-layer HIP graph capture: the mechanism already exists, and TP disables it
+
+There is already a decode-island graph capture in the tree
+(`ds4.c:24370-24440`, "design ported from the Entrpi/ds4 batched-serving fork").
+Two position-independent islands of each decode layer are captured and replayed;
+a replayed graph re-runs the captured kernels byte-for-byte.
+
+It is disabled for this deployment by construction:
+
+```c
+const bool decode_graphs_common_ok =
+    !g->placement && g->tp_world <= 1 && !g->cuda_tp_decode && ...;
+```
+
+`tp_world <= 1` is not incidental. Island 0 is
+`METAL_DECODE_LAYER_TO_QKV` (hc-pre -> QKV) and is gate-free, but **island 1 is
+`METAL_DECODE_LAYER_FROM_ATTN_TO_FFN` (attention output -> layer end) and
+contains both ring gates** (`ds4.c:26002-26056` attention-output gate,
+`ds4.c:27704-27748` FFN gate). Capturing it would freeze a host-driven
+collective into a device graph.
+
+Porting this to TP=4 therefore means capturing only gate-free segments. The one
+candidate is island 0 (hc-pre through QKV); the segment it covers is a minority
+of the 16% compute slice, and the decode-island machinery is exactly the kind
+that can freeze a pointer or a rank-dependent buffer key. The expected gain is
+well under 5% of decode against a real risk of a deadlock or silent divergence
+in a 4-node lockstep ring.
+
+Decision: **not enabled**, per the Tier 3 instruction to document and drop
+HIP-graph work that has no measurable gain on `gfx1151`. Measured basis: the
+84/16 split above plus the fact that at TP=4 the only capturable island is the
+smaller one.
+
+## 3. MoE / router fusion: already fused for gfx1151 decode
+
+The audit found the decode hot path is already fused and wave32-tuned:
+
+| stage | current implementation |
+|---|---|
+| routed MoE gate+up+SwiGLU | `moe_gate_up_mid_decode_lut_qwarp32_kernel` and `..._ptrs_kernel` (`rocm/ds4_rocm_moe.cuh`), plus `moe_gate_up_mid_sorted_p2_qwarp32_kernel` |
+| shared expert gate+up+SwiGLU | `shared_gate_up_swiglu_fuse` is on by default (`g->shared_gate_up_swiglu_fuse`, `ds4.c:19231`) |
+| router / top-k | `router_select_warp_topk_kernel` (`rocm/ds4_rocm_router.cuh`), one launch per layer |
+| warp shuffles | `warp_sum_f32_oldhip_w32`, `q8_0_scale_broadcast_oldhip_w32` (`rocm/ds4_rocm_q8.cuh`) |
+| QKV + rope | `g->cuda_qkv_kv_rope_fuse`, `g->cuda_q_norm_rope_fuse` |
+| attention-out -> HC | `metal_graph_hc_expand_fusion_eligible`; `DS4_CUDA_TP_ATTN_OUT_HC_FUSE` can also fuse the TP reduce into it |
+| HC pre norm+mix | fused path in `metal_graph_encode_decode_layer_phase` |
+
+46 fused/vectorized decode kernel sites were counted across the four files. The
+gate+up+SwiGLU fusion Tier 3 asks for is the `moe_gate_up_mid_decode_lut_*`
+family, which already computes gate, up and the SwiGLU product in one launch;
+the router is one wave-level top-k kernel per layer. There is no unfused
+intermediate left to merge without changing the reduction shape and therefore
+the numerics.
+
+Decision: **no kernel change**. Fusing further would only shave launches inside
+a 16% slice that is itself dominated by two 1 ms collectives per layer.
+
+## 4. What this means for throughput
+
+The measured Tier 3 "no change" state is decode 12.46 t/s at 4K and 12.09 t/s at
+64K, with DSpark off (Tier 1 keeps `DSPARK=0`: at TP=4 the drafter accepts 0% of
+its proposals, so combining it with Tier 3 would only add the verify cost).
+
+The single largest remaining decode lever is not in this tier: it is the 80
+serial ring exchanges themselves. Merging the two gates per layer is not
+possible without changing the math (the FFN input depends on the attention
+output), so the realistic options are a faster link or a lower-latency
+collective, not more kernel work.

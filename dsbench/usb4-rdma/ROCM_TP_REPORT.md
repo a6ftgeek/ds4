@@ -1713,3 +1713,88 @@ structure above becomes a clean win (480 -> 80 gates at ~1 ms each, ~446 ->
 Regression gate on the shipped binary (`ds4` `96f6f14801915b9eacef315340b3e502`):
 Vision correct, two structured tool calls, KV reuse `cached 929/978`,
 `NRestarts=0`, zero RNR/timeout/desync. DSpark remains off in the service.
+
+### 2026-11-25 (eighth session) — Avenue 1 step 1: why the fast multi-row gate is ring-window work
+
+No code change this session. The fast small-batch exchange the previous session
+called for turns out to need ring-aware receive windows, not a payload-size
+change; the exact constraints are below, together with the design. The tree stays
+at `9b821a6` and the service is healthy (`NRestarts=0`, `ds4`
+`96f6f14801915b9eacef315340b3e502`).
+
+#### The two paths, precisely
+
+*Row gate* (`ds41_sum_partial` -> `ds4_tp_gate_exchange` ->
+`tp_rdma_gate_exchange`, `ds4_tp.c:2399`), ~0.93 ms:
+
+* pre-posts a **sliding window of `DS4_TP_RDMA_RECV_WINDOW` (16) receives**, one
+  `tp_rdma_post_gate_recv(tp, seq + 16)` per completed gate, all keyed on **one
+  global seq counter** and one slot map (`tp_gate_slot`);
+* posts **one** `IBV_WR_SEND` of `tp->vec_bytes` (20 KB) from the slab slot;
+* drains the CQ until `r->recv_done >= seq`;
+* the window barrier is paid **once per 16 gates**, not per gate.
+
+*Batch gate* (`ds41_sum_partial_batch` -> `ds4_tp_batch_gate_exchange` ->
+`tp_rdma_big_gate_exchange`), ~37 ms:
+
+* posts `rows*chunks` receives **inline, every call**, into the batch in-slot;
+* pays `tp_rdma_window_barrier` **on every call** (UC does not retry a send that
+  arrives before the peer posts its receive, so the barrier is what guarantees
+  every rank is posted);
+* transfers in `tp_rdma_max_msg` chunks through a windowed loop;
+* has its own `block_active` state, separate from `recv_window_active`.
+
+That is the whole 40x: the barrier and the inline post are per call on the batch
+path and per 16 gates on the row path.
+
+#### Why "one `rows * vec_bytes` send/recv" is not a drop-in
+
+1. **The row window is depth-16 with a single seq counter and a single
+   `recv_window_active` flag.** Queueing 6x larger receives into that same
+   window would change the slot sizing and the `recv_done` accounting for every
+   ordinary decode gate that follows, so a verify block would corrupt the decode
+   window's bookkeeping.
+2. **The existing pre-posted block window is single-QP.** `tp_rdma_block_post_layer`
+   walks `rows x chunks` into the batch in-slot and `tp_rdma_block_gate_exchange`
+   posts plain `IBV_WR_SEND`s to one peer, with no ring forwarding. That is
+   exactly why `ds41_dspark_verify` gates the block on `tp_world == 2`
+   (`ds4.c`, `const bool tp_block = g->tp_world == 2;`) - the 2-rank protocol is
+   inherently pairwise.
+3. **At N ranks every hop must be posted with matching lengths on all four
+   ranks before any send.** The ring all-reduce forwards the payload around the
+   ring, so the receive window has to exist on every rank for every hop, which is
+   the guarantee the barrier provides today.
+
+#### Design (next session, ~120 lines in `ds4_tp.c`)
+
+Add a **second, independent sliding window** for batch payloads rather than
+reusing the row window:
+
+* new state: `batch_window_active`, `batch_recv_done`, `batch_seq`, and a
+  `DS4_TP_RDMA_BATCH_WINDOW` depth (8 is enough for 40 layers);
+* `tp_rdma_post_batch_recv(tp, seq)`: post `rows*chunks` receives into the batch
+  in-slot, `wr_id` tagged with the slot so `tp_rdma_drain_cq` can account for it
+  separately from row completions;
+* `tp_rdma_batch_window_open(rows)`: post the whole window once, one barrier,
+  set `batch_window_active` - paid **once per verify block**, not per gate;
+* `tp_rdma_batch_gate_fast(tp, layer, rows, seq)`: one send of `rows*vec_bytes`
+  from `batch_out`, drain until `batch_recv_done >= seq`, re-post the next seq's
+  receives (same sliding pattern as the row path);
+* `ds4_tp_batch_gate_exchange` routes to it when
+  `rows <= DS4_TP_BATCH_MAX_ROWS && env DS4_VERIFY_FAST_BATCH_GATE != 0`, with the
+  old barrier path as the fallback;
+* the verify block opens the window in `ds41_dspark_verify` and closes it on
+  exit, so ordinary decode never sees `batch_window_active`.
+
+Expected after that: Stage 1 (`DS4_VERIFY_BATCH_FFN_GATE=1`) 446 -> ~250 ms
+(240 row gates at 0.93 ms + 40 fast gates at ~1 ms), and Stage 1+2 (attention
+batched too) -> 80 gates, ~75-120 ms.
+
+#### Why it is not in this commit
+
+A receive-length mismatch on any one rank hangs the ring collective (UC sends are
+not retried and the ring has no reordering), and this stack is currently
+serving. The change needs its own bring-up with `make test-tp-ring` plus a
+deliberate desync test, not a build-deploy-verify cycle inside a serving window.
+The Stage 1/Stage 2 structure from `2d96423` is already in place and stays
+opt-in, so the fast path has only to be dropped in behind it.

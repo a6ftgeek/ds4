@@ -3155,7 +3155,18 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
             if (pending_assistant) {
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
-                    if (tool_context || i > last_user_idx) {
+                    /* Replay the reasoning block whenever the client supplied
+                     * one. Historical assistant turns used to be rendered as a
+                     * bare </think> unless the conversation was in a tool
+                     * context, which made the re-rendered token stream differ
+                     * from what the engine actually generated and forced the
+                     * live KV prefix to be rejected (reason=token-mismatch) on
+                     * every reasoning conversation. DS4_CHAT_NO_REPLAY_REASONING
+                     * restores the old rendering. */
+                    const bool replay_reasoning =
+                        m->reasoning && m->reasoning[0] &&
+                        getenv("DS4_CHAT_NO_REPLAY_REASONING") == NULL;
+                    if (replay_reasoning || tool_context || i > last_user_idx) {
                         buf_puts(&out, "<think>");
                         buf_puts(&out, m->reasoning ? m->reasoning : "");
                         buf_puts(&out, "</think>");
@@ -3429,7 +3440,16 @@ static char *render_deepseek41_chat_ordered(const chat_msgs *msgs, int start,
         } else if (!strcmp(m->role, "assistant")) {
             if (pending) {
                 buf_puts(&out, "<｜Assistant｜>");
-                if (think && (keep_reasoning || i > last_user)) {
+                /* Replay the reasoning block whenever the client supplied one,
+                 * even for historical turns: the live KV holds
+                 * <|Assistant|><think>{reasoning}</think> and a bare </think>
+                 * here made the re-rendered prompt diverge from the cached
+                 * tokens, so prefix reuse was always rejected with
+                 * reason=token-mismatch. DS4_CHAT_NO_REPLAY_REASONING restores
+                 * the old rendering. */
+                if (think && (keep_reasoning || i > last_user ||
+                              (m->reasoning && m->reasoning[0] &&
+                               getenv("DS4_CHAT_NO_REPLAY_REASONING") == NULL))) {
                     buf_puts(&out, "<think>");
                     buf_puts(&out, m->reasoning ? m->reasoning : "");
                 }

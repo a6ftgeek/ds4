@@ -58,6 +58,7 @@ MTP_MODEL=${MTP_MODEL:-gguf/DeepSeek-V4.1-Flash-DSpark.gguf}
 DSPARK_CONF=${DSPARK_CONF:-}
 DSPARK_EXACT=${DSPARK_EXACT:-0}
 DSPARK_STATS=${DSPARK_STATS:-0}
+TRACE_PATH=${TRACE_PATH:-}
 IPS=(192.168.1.101 192.168.1.102 192.168.1.103 192.168.1.104)
 HOSTS=(node1 node2 node3 node4)
 SSH=(ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30)
@@ -75,6 +76,11 @@ if [ "$DSPARK" = 1 ]; then
     [ "$DSPARK_EXACT" = 1 ] && spark+=(--mtp-exact-sampling)
 fi
 if [ "$DSPARK_STATS" = 1 ]; then ENVV="${ENVV:-} DS4_DSPARK_STATS=1"; fi
+
+# TRACE_PATH enables ds4-server's per-request trace, which records the exact
+# cache decision and a 17-token window around the first KV-prefix mismatch.
+trace=()
+if [ -n "$TRACE_PATH" ]; then trace=(--trace "$TRACE_PATH"); fi
 
 container() {  # container <rank> <binary> <extra args...>
     local r=$1 bin=$2; shift 2
@@ -156,11 +162,13 @@ do_start() {
         # would be attributed to the container scope in journald. Pipe it
         # through systemd-cat so Cockpit's ds4-tp4 unit log shows it too.
         ( cd "$REPO" && container 0 ./ds4-server --role coordinator \
-            --listen 0.0.0.0 "$RING_PORT" --host "$BIND" --port "$PORT" 2>&1 |
+            --listen 0.0.0.0 "$RING_PORT" --host "$BIND" --port "$PORT" \
+            "${trace[@]}" 2>&1 |
             systemd-cat -t ds4-tp4 ) &
     else
         ( cd "$REPO" && container 0 ./ds4-server --role coordinator \
-            --listen 0.0.0.0 "$RING_PORT" --host "$BIND" --port "$PORT" ) \
+            --listen 0.0.0.0 "$RING_PORT" --host "$BIND" --port "$PORT" \
+            "${trace[@]}" ) \
             >"$log" 2>&1 &
     fi
     local coord=$!

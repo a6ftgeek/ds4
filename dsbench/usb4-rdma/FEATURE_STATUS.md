@@ -802,3 +802,35 @@ matches**. `systemctl show -p NRestarts ds4-tp4.service` ->
 `NRestarts=0`; `systemctl is-active` -> `active`.
 
 Raw driver: `/tmp/fb/results.json` on node1 (not committed).
+
+## 2026-11-25 — `feat/rocm-tp-perf` (Tier 1-4 on top of `b90e0b1`)
+
+Branch `feat/rocm-tp-perf`, four nodes, `ds41f-q4`, TP=4 USB4 RDMA ring,
+`CTX=1048576`, vision on. Binary `ds4` md5 `cc86676a…` on all four ranks.
+Full detail and measurements: `ROCM_TP_REPORT.md` (Tier 1-4 + wrap-up sections).
+
+| tier | change | status |
+|---|---|---|
+| 1 | V4.1 DSpark drafter built from the pinned checkpoint (8.04 GiB, 81 tensors verified) and wired to all four ranks as an opt-in flag | **off by default**: 0/160 acceptance, verify 1.5-4.2 s per 6-row block, decode -41% when five drafts are forced; does not fit beside 1M ctx + vision (110.18 vs 109.44 GiB) |
+| 2 | short-prefill widening: batched sweep from 8 tokens at resident ROCm TP | **shipped**: <256-token prefill 4.7-5.4x (13.66 -> 64-65 t/s at 124; 12.58 -> 68.3 at 229); >=256-token prompts unchanged |
+| 2 | bit-exact row-batched split-K attention-output HIP kernel | **dropped**: identical output, no speedup (+0.6% at 4K, -1.1% at 16K) |
+| 3 | decode HIP-graph islands / MoE-router fusion | **no change**: ~84% of decode is ring round trips; decode islands are `tp_world<=1` by design (island 1 wraps both gates); MoE/router already fused on gfx1151 |
+| 4 | USB4 ring BF16/WHT6 payload compression + prefill overlap | **analysed, not implemented**: payload is 6-11% of prefill wall time, so 2x compression is worth ~3-5% prefill and 0% decode; overlap impossible (FFN waits on the attention-output reduce, one in-flight block) |
+
+Final end-to-end (shipped binary):
+
+| ctx | prompt tok | prefill | TTFT | decode | needle |
+|---|---:|---:|---:|---:|---|
+| 4K | 3061 | 81.45 t/s | 37.59 s | 12.72 t/s | recalled |
+| 16K | 11843 | 126.84 t/s | 93.38 s | 13.18 t/s | recalled |
+| 64K | 44781 | 144.48 t/s | 309.96 s | 12.86 t/s | recalled |
+
+Vision PNG (red circle / blue square / CAT 347) correct; OpenAI tool calling
+returns two structured calls; `NRestarts=0`; zero RNR/timeout/desync lines;
+GTT 101.4 GiB on node1 and 100.5 GiB on node2-4, MemAvailable 20-22 GiB.
+
+Open item: multi-turn KV prefix reuse did not engage in this sweep
+(`cached_tokens=0`, server `reason=token-mismatch` with the common prefix one
+token short of the live checkpoint) although `b90e0b1` recorded a working case.
+Pre-existing server behaviour, flagged with the `--trace` diagnostic to use
+next; not caused by Tiers 1-4.

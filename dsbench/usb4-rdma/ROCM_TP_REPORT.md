@@ -1127,3 +1127,97 @@ visible in the profile.
 
 Nothing changed, so there is no accuracy delta to report for this tier. The
 end-to-end gate for the shipped binary is in the wrap-up section below.
+
+# WRAP-UP — Tier 1-4 before/after on `feat/rocm-tp-perf`
+
+Final state 2026-11-25, branch `feat/rocm-tp-perf` (parent `b90e0b1`), four nodes,
+`ds41f-q4`, TP=4 over the USB4 RDMA ring, `CTX=1048576`, vision on, DSpark off.
+Binary `ds4` md5 `cc86676a131817300c2bc15aa19ca1b9`, identical on all four
+ranks; `ds4-server` `693ecfd9940093d560620a66f3f8ac76`.
+
+## What shipped
+
+| tier | change | verdict |
+|---|---|---|
+| 1 | V4.1 DSpark built (8.04 GiB, 81 tensors verified) and wired to all ranks via opt-in flags | **kept off** (`DSPARK=0`): 0/160 draft acceptance, verify 1.5-4.2 s/block |
+| 2a | short-prefill widening: resident ROCm TP uses the batched sweep from 8 tokens | **shipped**, 4.7-5.4x on <256-token prompts |
+| 2b | bit-exact row-batched split-K attention-output kernel | **dropped**: identical output, +0.6%/-1.1% (noise) |
+| 3 | decode HIP-graph islands + MoE/router fusion audit | **no change**: decode is 84% ring-bound, hot kernels already fused |
+| 4 | ring payload BF16/WHT6 compression + prefill overlap | **analysed, not implemented**: ~3-5% prefill ceiling, 0% decode |
+
+## Tier 1 — speculative decode (gated off)
+
+| arm (ctx 917,504, n=128, temp 0) | coding | prose | tool calling |
+|---|---:|---:|---:|
+| no DSpark | 5.26 t/s | 4.61 t/s | 3.06 t/s |
+| `--dspark --dspark-confidence 0.7` | 5.11 (-2.9%) | 4.80 (+4.1%) | 3.46 (+13.1%) |
+| `--dspark-confidence 0` (five drafts forced) | 3.12 (-41%) | — | — |
+
+Acceptance **0/160 drafts (0.00%)** over 32 instrumented cycles; draft 60 ms per
+5-token proposal; verify 1.5-4.2 s per 6-row block against ~78 ms for one ordinary
+decode token; GTT +6.6 GiB/rank (101,447 -> 108,001 MiB) and MemAvailable
+20 -> 14 GiB. At `CTX=1048576` the resident drafter does not fit the engine's
+admission budget (needs 110.18 GiB vs 109.44 GiB safe), hence 896K for the
+DSpark arms. The positive prose/tool deltas are the scheduler backing off to
+ordinary decode, not a speculative win.
+
+## Tier 2 — prefill
+
+| context | before | after | change |
+|---|---:|---:|---:|
+| 124 tokens | 13.66 t/s | **64.2-65.0 t/s** | **4.7x** |
+| 229 tokens | 12.58 t/s | **68.3 t/s** | **5.4x** |
+| 276 tokens | 75.97 t/s | 77.19 t/s | flat |
+| 4K | 81.31 t/s | 80.44 t/s | flat |
+| 16K | 127.48 t/s | 127.29 t/s | flat |
+| 64K | 145.98 t/s | 144.21 t/s | flat |
+
+TTFT for short turns fell 9.08 -> 1.93 s (124 tokens) and 18.21 -> 3.36 s
+(229 tokens). The batched 2D kernel produced byte-identical text
+(`2db15dd6`/`844924a5`) but no speedup, so it was reverted; the measurement is
+in the Tier 2 section above.
+
+## Tier 3 / Tier 4 — measured ceilings
+
+Decode is `80 x ~0.9-1.1 ms` of ring round trips in an 82.6 ms token, i.e. ~84%
+ring / ~16% compute, so every compute-side optimisation (HIP graphs, kernel
+fusion) shares that 16% ceiling. The tree already contains a decode-island graph
+capture, disabled at `tp_world > 1` because island 1 wraps both ring gates, and
+the decode MoE/router path is already fused (`moe_gate_up_mid_decode_lut_qwarp32`,
+`router_select_warp_topk`, wave32 shuffles). The ring payload is `rows x 1.31 MB`
+per chunk (58.7 GB at 64K) against ~2.5 GB/s per USB4 link, so BF16 payloads
+would be worth ~3% at 4K and ~5% at 64K prefill and nothing on decode, which is
+latency-bound; prefill compute cannot overlap the reduces because the FFN waits
+on the attention-output reduce and the ring allows one in-flight block.
+
+## Final end-to-end verification (shipped binary)
+
+| context | prompt tokens | prefill | TTFT | decode | needle (`ZX-4419-QQ`) |
+|---|---:|---:|---:|---:|---|
+| 4K | 3061 | 81.45 t/s | 37.59 s | 12.72 t/s | recalled |
+| 16K | 11843 | 126.84 t/s | 93.38 s | 13.18 t/s | recalled |
+| 64K | 44781 | 144.48 t/s | 309.96 s | 12.86 t/s | recalled |
+
+* Vision PNG (red circle, blue square, "CAT 347"): **correct**, all three elements.
+* OpenAI tool calling: two structured `tool_calls` with valid JSON arguments
+  (`read_file {"/etc/hostname"}`, `run_tests {"suite":"unit"}`).
+* Ring health: `NRestarts=0`, no RNR / retry / timeout / desync / QP-error line
+  in the coordinator or any worker log for the whole final run (the only grep hit
+  is the benign `gate-timeout=750ms` startup line).
+* GTT 101,427 MiB (node1) / 100,515 / 100,515 / 100,501 MiB; MemAvailable
+  20-22 GiB per node.
+
+### KV prefix reuse — not reproduced (open item)
+
+The `b90e0b1` report recorded turn-2 TTFT 40.61 -> 1.56 s with
+`cached_tokens=4062` of 4078. In this final sweep **every** multi-turn probe
+re-prefilled: `cached_tokens=0`, and the server logged
+`live kv cache miss ... common=<one below live> ... reason=token-mismatch`
+(for example `live=929 prompt=969 common=920`). `trace_cache_miss_reason()`
+requires `common == old_pos` (the whole live checkpoint must be a prefix of the
+incoming prompt), so a one-token divergence at the end of the cached span
+rejects the whole reuse. The tree already has a trace facility for exactly this
+(`trace_cache_capture`, a 17-token window around the first mismatch, written when
+the server runs with `--trace`); running the service with `--trace` and following
+one multi-turn request is the way to close this out. Flagged rather than fixed:
+it is a pre-existing server-side behaviour, not a change from Tiers 1-4.

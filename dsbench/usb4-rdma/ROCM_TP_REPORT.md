@@ -1313,3 +1313,90 @@ bound. Default stays 8192; the knob is kept as a documented diagnostic.
 * Tool calling: two structured calls with valid JSON arguments.
 * `NRestarts=0`; zero RNR / retry / timeout / desync / QP-error lines for the
   whole run (the only grep hit is the benign `gate-timeout=750ms` startup line).
+
+## 2026-11-25 (third session) — isolating the ROCm TP=4 DSpark defects
+
+Continues `7cec491`. DSpark remains **off**; the shipped default path is
+unchanged (the additions here are env-gated diagnostics). Final binary
+`ds4` `7edb69a0fede69e82bf8cb22c44a2697`, `ds4-server` `999ba99a912e82f0dd304e3dc7894c6e`,
+identical on all four ranks; service healthy, `NRestarts=0`, no ring errors.
+
+### 1. Drafter identity (all four ranks)
+
+`sha256 14f04ebf7314342d78921e2b9e28d8806fedc93a6551b72079fccd2f9ec5497b`,
+8,633,942,016 B, `stages=3 block=5 markov_rank=256 tensors=78`, i.e. the V4.1
+support file and not the older V4 0731 drafter.
+
+### 2. What the new diagnostics showed
+
+`DS4_DSPARK_SPEC_DEBUG=1` now prints, per block, the drafter's **base** argmax
+(before the Markov bias) next to its post-bias argmax (`DSPARK_MKV`), and the
+decoded text of the drafts and of the target's verified tokens.
+
+**The draft network itself is sane.** Base logits sit at 10-13 with varied,
+plausible tokens and no NaN:
+
+```
+DSPARK_MKV row=0 prev=101309 base_top=8905(12.469) post_top=8905(12.469)
+DSPARK_MKV row=0 prev=36098  base_top=62838(10.949) post_top=62838(10.949)
+```
+
+**The Markov bias is oversized and overrides it.** With the bias on, the same
+rows become:
+
+```
+base_top=22483(11.945) -> post_top=22663(58.462)     (+46 logits)
+base_top=8905(12.469)  -> post_top=418(9.975)        (suppresses the base top)
+```
+
+A CPU reference reading `markov_w1`/`markov_w2` straight out of the GGUF
+(`perf/markov_ref.py`) reproduces this exactly — bias `max=+31.57`,
+`mean=-6.55`, top tokens 2..6 for `prev=101309` — so it is inherent to the
+converted head, not a ROCm kernel. `DS4_DSPARK_NO_MARKOV=1` removes it; the
+drafter then proposes its own distribution but acceptance stays **0**.
+
+**The verify forward is wrong from the very first block.** Same prompt, temp 0:
+
+| run | output |
+|---|---|
+| DSpark off | `We need answer?` |
+| DSpark on, 6-row blocks | `Wearelli是非 candid candid …` |
+| DSpark on, 2-row blocks | `Wearelli是非 candid candid …` |
+| after continued use | `<｜begin▁of▁sentence｜>` repeated |
+
+With `keep=1` the emitted token is `argmax(verified row 0)`, so the model is
+emitting the verify's own logits: only the drafter-and-verify pair is involved.
+The first verify already disagrees with ordinary decode (`argmax` 8905 vs the
+target's 107838), and it happens with 2-row blocks too, so this is **not** the
+rollback leaving uncommitted rows behind — it is the verify forward's arithmetic
+at TP=4.
+
+### 3. Why a verify block costs 1.5-4.2 s
+
+The selector at `ds4.c:44587` enables `ds41_attention_batch` only for Apple:
+on ROCm `batch_attention = false`, so a 6-row verify block runs the **whole
+single-token graph once per row**. Every row therefore pays its own 80 ring
+gates — 480 gates per block instead of 80 — which is the 1.5-4.2 s.
+
+Enabling the batched path for verify blocks was tried and reverted: the block
+degraded into a `<｜begin▁of▁sentence｜>` loop and the verify stayed 1.6-2.5 s,
+so neither symptom is fixed by that selector alone.
+
+### 4. Where this leaves Avenue 1
+
+Two concrete defects are now isolated, and neither is where the earlier
+hypotheses pointed:
+
+1. **Verify-forward correctness at TP=4.** The batch is evaluated per row
+   through the single-token graph but with `verify_prefix` set, so the gate
+   path (`ds41_sum_partial_batch`'s slot branch) and KV publication differ from
+   the prefill rows that are known to be correct. Comparing a verify block's
+   row-0 logits against one ordinary decode step, per gate, is the next
+   measurement.
+2. **Per-row verify cost.** `ds41_attention_batch` needs to be validated for
+   ROCm (it exists, but no ROCm path has ever called it), which is what turns
+   480 gates into 80.
+
+The Markov head is a third, independent defect: the converted bias is 5-10x the
+base distribution's spread, which is worth revisiting against the upstream
+converter's intended scaling even after the verify is fixed.

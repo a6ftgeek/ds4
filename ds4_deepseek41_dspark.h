@@ -288,7 +288,13 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
                                  uint32_t pos, int token, ds41_gpu_graph *target_graph) {
     if (!d || !pos || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     ds41_prefill_row *b = &d->batch;
-    const bool local_experts = target_graph && target_graph->tp_world == 2;
+    /* The leader drafts alone at every rank count >= 2 (at world>2 the target
+     * vocabulary is replicated and no draft frame is exchanged), so the
+     * drafter's own MoE must see the raw expert tables on rank 0 instead of
+     * the rank's contiguous 1/world slice. Gating this on world==2 left the
+     * TP=4 drafter routing through a quarter of its experts, which made its
+     * proposals unrelated to the target and drove acceptance to 0%. */
+    const bool local_experts = target_graph && target_graph->tp_world >= 2;
     if (local_experts) ds4_gpu_tp_suspend_expert_sharding(1);
     bool ok = ds4_gpu_begin_commands() && ds41_dspark_seed(d, draft, pos);
     if (!ok) fprintf(stderr, "ds4: V4.1 DSpark seed failed\n");
